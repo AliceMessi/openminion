@@ -118,7 +118,19 @@ def _repair_missing_final_answer(
                         "The turn-closure gate already determined the goal is satisfied, "
                         "but it failed to provide the required final_answer. Return only "
                         "a concise user-facing final_answer grounded in the execution "
-                        "facts. Do not emit tool JSON, internal reasoning, or null."
+                        "facts: closure_action_outputs and any recent tool_results. "
+                        "Treat action_summary as the candidate answer under review and "
+                        "check it against those execution facts: preserve requested "
+                        "facts and identifiers that the execution facts support, "
+                        "correct candidate claims they do not support using those "
+                        "execution facts, and keep truthful failure or uncertainty "
+                        "wording when the execution facts are insufficient. Evaluate "
+                        "freshness_obligations against the execution facts supplied for "
+                        "this turn; a successful tool call does not by itself satisfy "
+                        "every obligation. Only submit_output is exposed during this "
+                        "call; do not infer that execution tools were unavailable when "
+                        "the supplied execution facts show they ran. Do not emit tool "
+                        "JSON, internal reasoning, or null."
                     )
                 },
             },
