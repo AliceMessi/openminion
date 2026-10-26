@@ -17,6 +17,7 @@ from ..constants import (
     BRAIN_STATE_WAITING_USER,
 )
 from ..schemas.state.action import ActionResult
+from .closure import final_close_message
 from .context import build_execution_context
 from .continuation import is_resume_like_input
 from .loop_contracts import ExecutionContext, ExecutionResult
@@ -152,6 +153,20 @@ def _respond_execute(ctx: ExecutionContext) -> ExecutionResult:
                 )
             },
         )
+    if reason_code == "entry_text_response":
+        # The entry's text answer ends the turn: check it against the turn's
+        # freshness obligations as a closing answer is. The candidate is this
+        # text; the only evidence is the action result built from it above.
+        checked = final_close_message(
+            state=ctx.state,
+            judgment=None,
+            action_result=action_result,
+            fallback_message=text,
+        )
+        if checked != text:
+            text = checked
+            if action_result is not None:
+                action_result = action_result.model_copy(update={"summary": text})
     return ExecutionResult.from_step_output(
         ctx.respond(
             message=text,
