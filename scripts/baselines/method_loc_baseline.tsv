@@ -82,7 +82,7 @@ src/openminion/modules/skill/runtime/skill/ingest.py	SkillIngestMixin._build_pac
 src/openminion/modules/skill/runtime/skill/matching.py	SkillMatchingMixin._score_match	150	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
 src/openminion/modules/storage/backends/hybrid_store.py	HybridStore.reindex	124	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
 src/openminion/modules/storage/cli.py	_add_storage_cli_subcommands	225	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
-src/openminion/modules/storage/cli.py	_run_storage_store_command	232	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
+src/openminion/modules/storage/cli.py	_run_storage_store_command	215	Issue 412 dispatches restore before StorageEngine construction, outside this method
 src/openminion/modules/storage/cli_registrar.py	_register_storage_commands_with_config	149	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
 src/openminion/modules/storage/cli_registrar.py	_register_storage_commands_without_config	132	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
 src/openminion/modules/storage/migrations/verify.py	run_verification	128	current over-threshold method baseline; ratchet downward via LCPA/HRDS precision lanes
