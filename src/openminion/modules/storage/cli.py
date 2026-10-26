@@ -99,6 +99,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "a2a-archive-old":
         return _run_a2a_archive_old(args, env_map)
 
+    if args.cmd == "restore":
+        # restore replaces the database file, so no StorageEngine (and none of
+        # its record-store connections) may be open on the target.
+        return _run_restore(args, sqlite_path=sqlite_path)
+
     engine = StorageEngine.from_paths(
         root_dir=root_dir,
         sqlite_path=sqlite_path,
@@ -231,23 +236,6 @@ def _run_storage_store_command(
             artifact = runner.backup(mode=args.mode)
             _reporter_safe_end(reporter, success=True)
             _print_json({"ok": True, "backup": artifact.to_dict()})
-            return 0
-        except Exception:
-            _reporter_safe_end(reporter, success=False)
-            raise
-    if args.cmd == "restore":
-        module_id = _resolve_module_id(args.namespace)
-        reporter = _select_reporter(args)
-        _reporter_safe_start(reporter, label=f"restore[{module_id}]")
-        try:
-            runner = _build_runner(
-                module_id=module_id,
-                sqlite_path=sqlite_path,
-            )
-            runner.restore(snapshot_path=args.snapshot_path, target_db_path=sqlite_path)
-            state = runner.detect()
-            _reporter_safe_end(reporter, success=True)
-            _print_json({"ok": True, "state": state.to_dict()})
             return 0
         except Exception:
             _reporter_safe_end(reporter, success=False)
@@ -698,6 +686,25 @@ def _run_pool_stats(args: argparse.Namespace, env_map) -> int:
             store.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _run_restore(args: argparse.Namespace, *, sqlite_path: str) -> int:
+    module_id = _resolve_module_id(args.namespace)
+    reporter = _select_reporter(args)
+    _reporter_safe_start(reporter, label=f"restore[{module_id}]")
+    try:
+        runner = _build_runner(
+            module_id=module_id,
+            sqlite_path=sqlite_path,
+        )
+        runner.restore(snapshot_path=args.snapshot_path, target_db_path=sqlite_path)
+        state = runner.detect()
+        _reporter_safe_end(reporter, success=True)
+        _print_json({"ok": True, "state": state.to_dict()})
+        return 0
+    except Exception:
+        _reporter_safe_end(reporter, success=False)
+        raise
 
 
 def _run_drill(args: argparse.Namespace, *, sqlite_path: str) -> int:
