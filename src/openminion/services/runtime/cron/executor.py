@@ -57,6 +57,32 @@ from openminion.tools.task.constants import (
 _CRON_LOGGER = get_logger("modules.cron")
 
 
+def _capture_candidate_extractor(
+    agent_service: Any,
+) -> Callable[[Any, str, str, str], list[dict[str, Any]]]:
+    """Fit the agent's keyword-only extractor to the capture recovery callback.
+
+    Recovery passes the runtime session store first; the extractor records its
+    events through the brain session API that the agent's runner uses for
+    turns, so that session API is passed instead.
+    """
+
+    def extract(
+        _sessions: Any, session_id: str, root_turn_id: str, user_message: str
+    ) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            agent_service.extract_memory_capture_candidates(
+                session_api=agent_service._get_runner().session_api,
+                session_id=session_id,
+                root_turn_id=root_turn_id,
+                user_message=user_message,
+            ),
+        )
+
+    return extract
+
+
 class CronTurnExecutor:
     """Execute daemon-hosted cron runs without closure-captured state."""
 
@@ -475,7 +501,7 @@ class CronTurnExecutor:
             assembly.recover_pending_captures(
                 sessions=self._runtime.sessions,
                 agent_id=agent_id,
-                extract_candidates=agent_service.extract_memory_capture_candidates,
+                extract_candidates=_capture_candidate_extractor(agent_service),
                 authorize=partial(
                     memory_capture_recovery_allowed,
                     policy=service_port.security_policy,
