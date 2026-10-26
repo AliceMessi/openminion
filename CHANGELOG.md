@@ -7,6 +7,16 @@ This file tracks package-facing release notes for `openminion`.
 
 ## Unreleased
 
+- Check an entry step's text answer against the turn's typed freshness
+  obligations before it ends the turn, as a judge's closing answer is
+  checked. The respond route now finalizes the entry text with
+  `final_close_message`: an answer whose evidence meets the obligations is
+  kept unchanged, and one without the required live-data or exact-date
+  evidence becomes the existing freshness-failure message, with the
+  verifier's reasons in the freshness diagnostics. This covers a first entry
+  step that answers in text and a continuation step after the closure
+  freshness guard blocks a close. Clarify questions, other respond decisions
+  and the tool/judge path are unchanged (Refs #419).
 - Let SDK turns complete with an external memory backend that does not
   implement atomic capture bundles, such as the bundled `reference-sqlite`
   adapter. The backend adapter now reports the missing optional
