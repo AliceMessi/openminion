@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,6 +45,15 @@ from tests._room_participant_scenarios import (
     check_tied_join_order,
     check_upgraded_join_order,
     legacy_participant_rows,
+)
+from tests._runtime_storage_backend_scenarios import (
+    AGENT_ID,
+    ROOM_NAME,
+    room_create,
+    start_runtime,
+    start_wrapper,
+    state_db,
+    write_runtime_config,
 )
 from tests._run_status_scenarios import (
     append_nonstandard_values,
@@ -1162,3 +1172,139 @@ def test_postgres_metadata_strings_migration_rolls_back_whole_and_reruns() -> No
             assert_rows_match_metadata(store)
         finally:
             record_store.close()
+
+
+@contextmanager
+def _runtime_database(prefix: str) -> Iterator[SimpleNamespace]:
+    """A fresh schema whose URL names its own `application_name`."""
+    postgres_url = str(os.getenv("OPENMINION_TEST_POSTGRES_URL", "")).strip()
+    if not postgres_url:
+        pytest.skip("OPENMINION_TEST_POSTGRES_URL is not set")
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    token = uuid.uuid4().hex[:12]
+    schema_name = f"{prefix}_{token}"
+    application_name = f"{prefix}_{token}"
+    admin_engine = sqlalchemy.create_engine(postgres_url, future=True)
+    with admin_engine.begin() as conn:
+        conn.execute(sqlalchemy.text(f'CREATE SCHEMA "{schema_name}"'))
+
+    def connections() -> int:
+        """Server connections with this `application_name`, once they settle."""
+        query = sqlalchemy.text(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = :name"
+        )
+        deadline = time.monotonic() + 5.0
+        while True:
+            with admin_engine.connect() as conn:
+                count = conn.execute(query, {"name": application_name}).scalar_one()
+            if not count or time.monotonic() >= deadline:
+                return int(count)
+            time.sleep(0.05)
+
+    def rows(sql: str, **params: object) -> list[tuple[Any, ...]]:
+        """Rows read through an independent connection, inside the schema."""
+        with admin_engine.connect() as conn:
+            conn.execute(sqlalchemy.text(f'SET search_path TO "{schema_name}"'))
+            return [tuple(row) for row in conn.execute(sqlalchemy.text(sql), params)]
+
+    url = (
+        f"{_schema_url(postgres_url, schema_name)}&application_name={application_name}"
+    )
+    try:
+        yield SimpleNamespace(url=url, connections=connections, rows=rows)
+    finally:
+        with admin_engine.begin() as conn:
+            conn.execute(
+                sqlalchemy.text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.postgres
+def test_postgres_runtime_storage_starts_and_closes_the_api_runtime(
+    tmp_path: Path,
+) -> None:
+    from openminion import Agent
+    from openminion.modules.storage.backends.postgres import RecordStorePostgres
+
+    root = tmp_path / "root"
+    with _runtime_database("om437_runtime") as database:
+        runtime = start_runtime(write_runtime_config(root, postgres_url=database.url))
+        try:
+            assert isinstance(runtime.runtime_storage.record_store, RecordStorePostgres)
+            assert runtime.storage_connection is None
+            session = runtime.sessions.resolve_session(
+                agent_id=AGENT_ID, channel="console", target="om437-runtime"
+            )
+            runtime.sessions.append_message(
+                session_id=session.id, role="inbound", body="hello"
+            )
+            assert database.rows(
+                "SELECT target FROM sessions WHERE id = :id", id=session.id
+            ) == [("om437-runtime",)]
+            assert database.rows(
+                "SELECT body FROM messages WHERE session_id = :id", id=session.id
+            ) == [("hello",)]
+
+            with Agent(runtime=runtime) as agent:
+                result = agent.run("hello")
+            assert result.run_state == "completed"
+            assert database.rows(
+                "SELECT count(*) FROM messages WHERE session_id = :id",
+                id=result.session_id,
+            ) == [(2,)]
+        finally:
+            runtime.close()
+
+        assert database.connections() == 0
+    assert not state_db(root).exists()
+
+
+@pytest.mark.postgres
+def test_postgres_runtime_storage_room_create_writes_the_room_to_postgres(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "root"
+    with _runtime_database("om437_room") as database:
+        exit_code, summary = room_create(
+            write_runtime_config(root, postgres_url=database.url), monkeypatch, capsys
+        )
+
+        assert exit_code == 0
+        assert summary["participants"] == "1"
+        assert summary["active_agent"] == AGENT_ID
+        assert database.rows(
+            "SELECT metadata_json::json ->> 'name' FROM sessions WHERE id = :id",
+            id=summary["room"],
+        ) == [(ROOM_NAME,)]
+        assert database.rows(
+            "SELECT participant_type, participant_id, role FROM room_participants"
+            " WHERE session_id = :id",
+            id=summary["room"],
+        ) == [("agent", AGENT_ID, "owner")]
+        assert database.connections() == 0
+    assert not state_db(root).exists()
+
+
+@pytest.mark.postgres
+def test_postgres_runtime_storage_wrapper_has_no_sqlite_storage_handle(
+    tmp_path: Path,
+) -> None:
+    from openminion.modules.storage.backends.postgres import RecordStorePostgres
+
+    root = tmp_path / "root"
+    with _runtime_database("om437_wrapper") as database:
+        wrapper = start_wrapper(write_runtime_config(root, postgres_url=database.url))
+        try:
+            runtime = wrapper.runtime_manager
+            assert wrapper.storage is None
+            assert isinstance(wrapper.sess, SessionStore)
+            assert wrapper.sess is runtime.sessions
+            assert isinstance(runtime.runtime_storage.record_store, RecordStorePostgres)
+        finally:
+            wrapper.close()
+
+        assert database.connections() == 0
+    assert not state_db(root).exists()
