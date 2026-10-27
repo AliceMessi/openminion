@@ -213,7 +213,7 @@ class RuntimeProfilesMixin:
     memory_root: Path
     tool_workspace_root: Path | None
     runtime_storage: RuntimeStorageContext
-    storage_connection: Connection
+    storage_connection: Connection | None
     telemetry_service: TelemetryService
     telemetryctl: TelemetryCtl
     sessions: SessionStore
