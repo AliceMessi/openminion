@@ -213,7 +213,9 @@ class RuntimeProfilesMixin:
     memory_root: Path
     tool_workspace_root: Path | None
     runtime_storage: RuntimeStorageContext
-    storage_connection: Connection
+    # The SQLite handle of the runtime record store, None for other backends
+    # (use runtime_storage or sessions).
+    storage_connection: Connection | None
     telemetry_service: TelemetryService
     telemetryctl: TelemetryCtl
     sessions: SessionStore

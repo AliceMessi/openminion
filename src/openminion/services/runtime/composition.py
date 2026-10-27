@@ -11,7 +11,7 @@ class OpenMinionRuntime:
     module adapters as explicit optional fields (None) rather than fake wiring.
     """
 
-    storage: object
+    storage: object | None
     sess: object
     artifact: object | None
     mem: object | None
