@@ -7,6 +7,7 @@ import pytest
 
 from openminion.api.core import bootstrap as bootstrap_module
 from openminion.api.core.infrastructure import RuntimePaths
+from openminion.base.config.core import StorageConfig
 from openminion.modules.memory.errors import MemoryQueryUnavailableError, StoreReadError
 from openminion.modules.memory.interfaces import MemoryNamespaceQueryInterface
 from openminion.modules.memory.storage.base import ListQueryOptions, SearchQueryOptions
@@ -124,7 +125,9 @@ def test_runtime_exposes_same_memory_adapter(monkeypatch) -> None:
 
     runtime = bootstrap_module.finalize_runtime_instance(
         cls=_RuntimeCapture,
-        base_config=SimpleNamespace(runtime=SimpleNamespace(tool_workspace_root=None)),
+        base_config=SimpleNamespace(
+            runtime=SimpleNamespace(tool_workspace_root=None), storage=StorageConfig()
+        ),
         manager=object(),
         paths=RuntimePaths(
             home=Path("/tmp/home"),
