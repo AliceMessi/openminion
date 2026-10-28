@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -342,43 +343,52 @@ class StorageEngine:
                 config, sqlite=sqlite, telemetry_hook=effective_hook
             ),
         )
-        blob = backend_registry.create_blob(
-            config.blob_backend,
-            _blob_backend_options(config, root=root),
-        )
-        ensure_interface_compatibility(record, interface="record_store")
-        ensure_interface_compatibility(blob, interface="blob_store")
-        vector_store = _create_vector_store(
-            config,
-            registry=backend_registry,
-            sqlite=sqlite,
-        )
-        hybrid = HybridStore(
-            record_store=record,
-            blob_store=blob,
-            fallback_root=fallback,
-            default_namespace=namespace,
-        )
-        ensure_interface_compatibility(hybrid, interface="hybrid_store")
-
-        return cls(
-            config=_effective_storage_engine_config(
+        vector_store = None
+        try:
+            blob = backend_registry.create_blob(
+                config.blob_backend,
+                _blob_backend_options(config, root=root),
+            )
+            ensure_interface_compatibility(record, interface="record_store")
+            ensure_interface_compatibility(blob, interface="blob_store")
+            vector_store = _create_vector_store(
                 config,
-                root=root,
+                registry=backend_registry,
                 sqlite=sqlite,
-                fallback=fallback,
-                namespace=namespace,
-            ),
-            blob_store=blob,
-            record_store=record,
-            hybrid_store=hybrid,
-            vector_store=vector_store,
-            health_emitter=_start_pool_health_emitter(
-                config,
-                record=record,
-                telemetry_hook=effective_hook,
-            ),
-        )
+            )
+            hybrid = HybridStore(
+                record_store=record,
+                blob_store=blob,
+                fallback_root=fallback,
+                default_namespace=namespace,
+            )
+            ensure_interface_compatibility(hybrid, interface="hybrid_store")
+
+            return cls(
+                config=_effective_storage_engine_config(
+                    config,
+                    root=root,
+                    sqlite=sqlite,
+                    fallback=fallback,
+                    namespace=namespace,
+                ),
+                blob_store=blob,
+                record_store=record,
+                hybrid_store=hybrid,
+                vector_store=vector_store,
+                health_emitter=_start_pool_health_emitter(
+                    config,
+                    record=record,
+                    telemetry_hook=effective_hook,
+                ),
+            )
+        except BaseException:
+            # close the backends this call created, as close() would
+            for backend in (vector_store, record):
+                if backend is not None and callable(getattr(backend, "close", None)):
+                    with suppress(Exception):
+                        backend.close()
+            raise
 
     @classmethod
     def from_paths(
