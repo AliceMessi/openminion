@@ -203,6 +203,7 @@ def runtime_turn_request_from_manager_request(
         ),
         run_profile_overrides=run_profile_overrides,
         explicit_agent=request.explicit_agent,
+        trusted_consolidation_context=request.trusted_consolidation_context,
     )
 
 

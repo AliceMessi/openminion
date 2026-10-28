@@ -69,7 +69,12 @@ scope	max_python_files	max_loc
 # the store at that step, in the existing assembly builder (+33 LOC over
 # dev 8c0568f7 at 41793; file count unchanged at 208).
 # Issues 420 + 390 (2026-10-26) remeasured together on dev 7af275db: 41852.
-services	208	41852
+# Issue 456 (2026-10-28) carries a scheduled memory consolidation job's fields
+# from the cron executor to the brain as a typed turn-request context through
+# the existing manager, ingress and gateway owners, and drops caller-supplied
+# memory_consolidation_* metadata at ingress (+27 LOC over dev 39c36a1b at
+# 41852; file count unchanged at 208).
+services	208	41879
 services/security	6	187
 services/stats	1	25
 services/tool	3	50

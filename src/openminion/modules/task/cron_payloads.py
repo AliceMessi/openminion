@@ -4,6 +4,7 @@ import json
 from sqlite3 import Error as SQLiteError
 from typing import Any, Mapping
 
+from openminion.modules.runtime.contracts import MemoryConsolidationTurnContext
 from openminion.modules.task.scheduling.interfaces import CronError
 
 from openminion.tools.task.constants import (
@@ -393,7 +394,6 @@ def build_cron_request_payload(
     run: dict[str, Any],
     message: Any,
     payload: dict[str, Any] | None,
-    consolidation_metadata: MetadataResolver,
     watch_metadata: MetadataResolver,
 ) -> dict[str, Any]:
     resolved_payload = _resolved_payload(job=job, payload=payload)
@@ -408,7 +408,6 @@ def build_cron_request_payload(
         _add_payload_cron_meta(
             cron_meta,
             resolved_payload,
-            consolidation_metadata=consolidation_metadata,
             watch_metadata=watch_metadata,
         )
     if cron_meta:
@@ -453,49 +452,36 @@ def _add_payload_cron_meta(
     cron_meta: dict[str, str],
     payload: dict[str, Any],
     *,
-    consolidation_metadata: MetadataResolver,
     watch_metadata: MetadataResolver,
 ) -> None:
     for key in ("linked_task_id", "goal_id", "mission_id", "user"):
         value = str(payload.get(key, "") or "").strip()
         if value:
             cron_meta[key] = value
-    _add_consolidation_cron_meta(cron_meta, consolidation_metadata(payload))
     watch = watch_metadata(payload)
     if watch is not None:
         _add_watch_cron_meta(cron_meta, watch)
 
 
-def _add_consolidation_cron_meta(
-    cron_meta: dict[str, str],
-    consolidation: dict[str, Any] | None,
-) -> None:
+def memory_consolidation_turn_context(
+    consolidation: Mapping[str, Any] | None,
+) -> MemoryConsolidationTurnContext | None:
+    """The job's consolidation fields for its turn request, not its public meta."""
     if consolidation is None:
-        return
-    cron_meta["memory_consolidation_job"] = "true"
-    cron_meta["memory_consolidation_target_scope"] = str(
-        consolidation.get("target_scope", "") or ""
-    ).strip()
-    for metadata_key, source_key, default in (
-        (
-            "memory_consolidation_batch_limit",
-            "batch_limit",
-            DEFAULT_CONSOLIDATION_BATCH_LIMIT,
+        return None
+    return MemoryConsolidationTurnContext(
+        target_scope=str(consolidation.get("target_scope", "") or "").strip(),
+        batch_limit=_int_or_default(
+            consolidation.get("batch_limit"), DEFAULT_CONSOLIDATION_BATCH_LIMIT
         ),
-        (
-            "memory_consolidation_max_iterations",
-            "max_iterations",
-            DEFAULT_CONSOLIDATION_MAX_ITERATIONS,
+        max_iterations=_int_or_default(
+            consolidation.get("max_iterations"), DEFAULT_CONSOLIDATION_MAX_ITERATIONS
         ),
-        (
-            "memory_consolidation_timeout_seconds",
-            "timeout_seconds",
+        timeout_seconds=_int_or_default(
+            consolidation.get("timeout_seconds"),
             DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS,
         ),
-    ):
-        cron_meta[metadata_key] = str(
-            _int_or_default(consolidation.get(source_key), default)
-        )
+    )
 
 
 def _add_watch_cron_meta(cron_meta: dict[str, str], watch: dict[str, Any]) -> None:

@@ -55,6 +55,29 @@ class TurnChunk:
 
 
 @dataclass(frozen=True)
+class MemoryConsolidationTurnContext:
+    """A scheduled memory consolidation job's fields for that job's own turn.
+
+    Only the cron executor attaches it to a turn request. Runtime ingress
+    drops caller-supplied `memory_consolidation_*` metadata.
+    """
+
+    target_scope: str
+    batch_limit: int
+    max_iterations: int
+    timeout_seconds: int
+
+    def as_inbound_metadata(self) -> dict[str, str]:
+        return {
+            "memory_consolidation_job": "true",
+            "memory_consolidation_target_scope": self.target_scope,
+            "memory_consolidation_batch_limit": str(self.batch_limit),
+            "memory_consolidation_max_iterations": str(self.max_iterations),
+            "memory_consolidation_timeout_seconds": str(self.timeout_seconds),
+        }
+
+
+@dataclass(frozen=True)
 class TurnRequest:
     trace_id: str
     agent_id: str
@@ -65,6 +88,7 @@ class TurnRequest:
     stream: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
     explicit_agent: bool = False
+    trusted_consolidation_context: MemoryConsolidationTurnContext | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +109,7 @@ class AgentHandle:
 __all__ = [
     "AgentHandle",
     "AgentStatus",
+    "MemoryConsolidationTurnContext",
     "ToolCallSummary",
     "TURN_STREAM_SCHEMA_VERSION",
     "TurnChunk",

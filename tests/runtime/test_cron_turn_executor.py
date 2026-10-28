@@ -6,10 +6,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from openminion.modules.runtime.contracts import TurnError, TurnResponse
+from openminion.modules.runtime.contracts import (
+    MemoryConsolidationTurnContext,
+    TurnError,
+    TurnResponse,
+)
 from openminion.modules.task.scheduling import CronError
 from openminion.services.runtime.cron.delivery import CronDeliveryBridge
 from openminion.services.runtime.cron.executor import CronTurnExecutor
+from openminion.services.runtime.daemon import build_turn_request
 from openminion.modules.tool import build_default_tool_registry
 from openminion.modules.tool.errors import ToolRuntimeError
 from openminion.modules.tool.exposure import ToolExposureProfile
@@ -180,6 +185,10 @@ def _request_builder(payload: dict[str, object], agent_id: str) -> object:
     )
 
 
+def _daemon_request_builder(payload: dict[str, object], agent_id: str) -> object:
+    return build_turn_request(payload, default_agent_id=agent_id)
+
+
 def test_cron_turn_executor_success_injects_metadata() -> None:
     runtime, runtime_manager = _runtime(
         [SimpleNamespace(final_text="cron ok")],
@@ -237,7 +246,7 @@ def test_cron_turn_executor_builds_typed_consolidation_watermark() -> None:
     executor = CronTurnExecutor(
         runtime=runtime,
         cron_store=_FakeCronStore(),
-        request_builder=_request_builder,
+        request_builder=_daemon_request_builder,
         timeout_s=90.0,
     )
 
@@ -356,7 +365,7 @@ def test_cron_turn_executor_forwards_memory_consolidation_metadata() -> None:
     executor = CronTurnExecutor(
         runtime=runtime,
         cron_store=_FakeCronStore(),
-        request_builder=_request_builder,
+        request_builder=_daemon_request_builder,
         timeout_s=90.0,
     )
 
@@ -380,11 +389,25 @@ def test_cron_turn_executor_forwards_memory_consolidation_metadata() -> None:
     )
 
     request = runtime_manager.submitted[0]
-    assert request.meta["memory_consolidation_job"] == "true"
-    assert request.meta["memory_consolidation_target_scope"] == "agent:agent-explicit"
-    assert request.meta["memory_consolidation_batch_limit"] == "8"
-    assert request.meta["memory_consolidation_max_iterations"] == "2"
-    assert request.meta["memory_consolidation_timeout_seconds"] == "30"
+    assert request.trusted_consolidation_context == MemoryConsolidationTurnContext(
+        target_scope="agent:agent-explicit",
+        batch_limit=8,
+        max_iterations=2,
+        timeout_seconds=30,
+    )
+    assert request.trusted_consolidation_context.as_inbound_metadata() == {
+        "memory_consolidation_job": "true",
+        "memory_consolidation_target_scope": "agent:agent-explicit",
+        "memory_consolidation_batch_limit": "8",
+        "memory_consolidation_max_iterations": "2",
+        "memory_consolidation_timeout_seconds": "30",
+    }
+    # The fields are not public request meta, which callers can also set.
+    assert request.meta == {
+        "cron_job_id": "job-consolidate",
+        "cron_run_id": "run-consolidate",
+        "scheduled_for": "2026-03-20T00:00:00Z",
+    }
 
 
 def test_cron_turn_executor_submits_once_per_acquired_attempt() -> None:

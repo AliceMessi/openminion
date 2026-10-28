@@ -40,6 +40,10 @@ def execute_runtime_turn(
     inbound_metadata = dict(request.inbound_metadata or {})
     if request.trusted_subagent_context is not None:
         inbound_metadata.update(request.trusted_subagent_context.as_inbound_metadata())
+    if request.trusted_consolidation_context is not None:
+        inbound_metadata.update(
+            request.trusted_consolidation_context.as_inbound_metadata()
+        )
     context = _build_turn_context(
         message=request.message,
         forced_tools=list(request.forced_tools),

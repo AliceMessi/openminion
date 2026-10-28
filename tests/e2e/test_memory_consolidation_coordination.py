@@ -19,6 +19,7 @@ from openminion.modules.memory.storage.memory import InMemoryMemoryStore
 from openminion.modules.tool.runtime import RuntimeContext
 from openminion.modules.tool.runtime.policy import Policy
 from openminion.modules.session.storage.sqlite_store import SQLiteSessionStore
+from openminion.modules.task.cron_payloads import memory_consolidation_turn_context
 from openminion.modules.task.scheduling.schedule import to_iso_utc, utc_now
 from openminion.services.brain.post_execution import BrainBridgeTurnMixin
 from openminion.services.cron import CronScheduler
@@ -113,10 +114,15 @@ def test_scheduled_consolidation_rejects_off_batch_then_preserves_valid_counts(
         memory_api=memory_service,
         session_api=session_api,
     )
+    # The executor attaches these fields to its turn request, not to its meta.
+    context = memory_consolidation_turn_context(
+        cron_executor._consolidation_metadata(payload)
+    )
+    assert context is not None
     BrainBridgeTurnMixin()._inject_resume_task_hints(
         runner=runner,
         session_id=request_payload["session_id"],
-        inbound_metadata=request_payload["meta"],
+        inbound_metadata={**request_payload["meta"], **context.as_inbound_metadata()},
     )
     state_inline = session_api.put_working_state.call_args.kwargs["state_inline"]
     consolidation = state_inline["module_state"]["memory_consolidation"]

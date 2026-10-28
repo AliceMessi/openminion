@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from threading import Event, Thread
 from types import SimpleNamespace
 import warnings
@@ -14,6 +15,7 @@ from openminion.base.config import (
     UnknownProfileError,
     resolve_agent_config,
 )
+from openminion.modules.runtime.contracts import MemoryConsolidationTurnContext
 from openminion.services.stats import RunStats
 from openminion.services.runtime.ingress import (
     TurnRequestError,
@@ -283,6 +285,37 @@ def test_public_consolidation_metadata_does_not_reach_the_gateway(
     assert [
         key for key in inbound_metadata if key.startswith("memory_consolidation_")
     ] == []
+
+
+def test_trusted_consolidation_context_is_projected_after_public_parsing() -> None:
+    runtime = _RuntimeStub()
+    public_request = build_manager_turn_request(
+        {
+            "message": "hi",
+            "session_id": "scheduled",
+            "meta": _PUBLIC_CONSOLIDATION_METADATA,
+            "trusted_consolidation_context": {"target_scope": "agent:main"},
+        },
+        default_agent_id="main",
+    )
+    assert public_request.trusted_consolidation_context is None
+    context = MemoryConsolidationTurnContext(
+        target_scope="agent:main", batch_limit=3, max_iterations=2, timeout_seconds=30
+    )
+    request = runtime_turn_request_from_manager_request(
+        runtime=runtime,
+        request=replace(public_request, trusted_consolidation_context=context),
+    )
+
+    execute_runtime_turn(runtime=runtime, request=request)
+
+    inbound_metadata = runtime.gateway.calls[0]["inbound_metadata"]
+    assert {
+        key: value
+        for key, value in inbound_metadata.items()
+        if key.startswith("memory_consolidation_")
+    } == context.as_inbound_metadata()
+    assert inbound_metadata["memory_consolidation_batch_limit"] == "3"
 
 
 def test_trusted_subagent_context_is_projected_after_public_parsing() -> None:

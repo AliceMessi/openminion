@@ -359,6 +359,7 @@ class AgentRuntimeManager:
             stream=bool(req.stream),
             meta=dict(req.meta or {}),
             explicit_agent=bool(req.explicit_agent),
+            trusted_consolidation_context=req.trusted_consolidation_context,
         )
         if not request.agent_id:
             raise ValueError("agent_id must be non-empty")

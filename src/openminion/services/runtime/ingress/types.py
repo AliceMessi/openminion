@@ -6,7 +6,11 @@ from typing import Any, cast
 from collections.abc import Iterator, Mapping
 
 from openminion.base.config import RunProfileOverrides
-from openminion.modules.runtime.contracts import TurnChunk, TurnResponse
+from openminion.modules.runtime.contracts import (
+    MemoryConsolidationTurnContext,
+    TurnChunk,
+    TurnResponse,
+)
 from openminion.services.runtime.manager import TurnRequest
 from openminion.services.runtime.manager import TurnHandle as ManagerTurnHandle
 from openminion.modules.telemetry.usage import RunStats
@@ -40,6 +44,7 @@ class RuntimeTurnRequest:
     )
     trusted_subagent_context: Any | None = None
     explicit_agent: bool = False
+    trusted_consolidation_context: MemoryConsolidationTurnContext | None = None
 
 
 @dataclass(frozen=True)

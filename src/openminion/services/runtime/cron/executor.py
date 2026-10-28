@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable, cast
@@ -30,6 +31,7 @@ from openminion.modules.task.cron_payloads import (
     build_expired_watch_result,
     finalize_watch_turn,
     mark_idle_tick_request,
+    memory_consolidation_turn_context,
     raise_for_cron_turn_errors,
     turn_wait_timeout as wait,
     watch_condition_value,
@@ -537,6 +539,9 @@ class CronTurnExecutor:
             except Exception:
                 pass
         request = self._request_builder(request_payload, agent_id)
+        if consolidation:
+            context = memory_consolidation_turn_context(consolidation)
+            request = replace(request, trusted_consolidation_context=context)
         handle = manager.submit_turn(request)
         result = handle.result(timeout_s=wait(self._timeout_s, request_payload))
         return build_cron_turn_result(
@@ -757,7 +762,6 @@ class CronTurnExecutor:
             run=run,
             message=message,
             payload=payload,
-            consolidation_metadata=self._consolidation_metadata,
             watch_metadata=self._watch_metadata,
         )
 

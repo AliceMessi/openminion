@@ -15,6 +15,8 @@ _INBOUND_META_SKIP = {
     "capability_category",
     "permission_mode",
 }
+# Set only from a request's trusted consolidation context (execution.py).
+_CONSOLIDATION_META_PREFIX = "memory_consolidation_"
 
 
 def decode_json_if_string(value: Any) -> Any:
@@ -49,6 +51,8 @@ def parse_inbound_metadata(
             raise error_factory(
                 "`inbound_metadata` cannot set reserved subagent fields."
             )
+        if normalized_key.startswith(_CONSOLIDATION_META_PREFIX):
+            continue
         parsed[normalized_key] = str(value or "").strip()
     return parsed
 
@@ -159,6 +163,8 @@ def apply_managed_meta(
     for raw_key, raw_value in meta.items():
         key = str(raw_key or "").strip()
         if not key or key in _INBOUND_META_SKIP:
+            continue
+        if key.startswith(_CONSOLIDATION_META_PREFIX):
             continue
         updated[key] = str(raw_value or "").strip()
     return updated or None

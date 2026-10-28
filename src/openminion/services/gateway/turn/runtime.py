@@ -255,6 +255,12 @@ def _extract_ephemeral_prompt_metadata(
         "cron_job_id",
         "cron_run_id",
         "scheduled_for",
+        # set only by runtime ingress from a trusted consolidation context.
+        "memory_consolidation_job",
+        "memory_consolidation_target_scope",
+        "memory_consolidation_batch_limit",
+        "memory_consolidation_max_iterations",
+        "memory_consolidation_timeout_seconds",
     }
     extracted: dict[str, str] = {}
     for key in allowed_keys:
