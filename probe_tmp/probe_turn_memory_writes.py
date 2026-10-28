@@ -27,7 +27,8 @@ Steps in each case (every turn has an approval callback that records and denies)
       scripted model routes the consolidation turn into the act loop (entry
       `decompose` with no subtasks); if the request it then answers contains the
       `tool_outcome` candidate id, it replies with a `memory_consolidation`
-      trailer that promotes that candidate (a real model may decide otherwise)
+      trailer that promotes that candidate (a real model may decide otherwise;
+      the probe records what the runtime does with that decision)
   T6  SDK `Agent.run`, session s3: "Say hello."
 After T1, the case also asks recovery's gate for T1's capture and the turn's
 tool adapter for `memory.write`.
@@ -547,6 +548,10 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
         readback["T6_promoted_ids"] = [h for d in promoted for h in id_hits(provider, a, b, d)]
         readback["T6_refused_text"] = id_hits(provider, a, b, REFUSED_TEXT)
         readback["T6_candidate_id"] = [h for d in row["tool_outcome_candidate_ids"] for h in id_hits(provider, a, b, d)]
+        later = [turns[t]["request_range"] for t in ("T4", "T5", "T6")]
+        readback["T4_T6_candidate_or_refused_text"] = [
+            h for a2, b2 in later for needle in [*row["tool_outcome_candidate_ids"], REFUSED_TEXT, TOOL_ARGS["key"]]
+            for h in id_hits(provider, a2, b2, needle)]
         row["readback"] = readback
         row["all_outcome_feedback_calls"] = [w for w in rec.writes if w["method"] == "apply_outcome_feedback"]
         row["provider_hosts"] = sorted({provider.base_url.split("/")[2].split(":")[0]})
@@ -725,6 +730,11 @@ def consolidation_facts(case: dict[str, Any]) -> dict[str, Any]:
         "memory_write_targets": sorted({d.get("target") for d in cons.get("memory_write_decisions", [])}),
         "signal_parsed": cons.get("signal_parsed"), "decisions_applied": cons.get("decisions_applied"),
         "T6_promoted_or_refused_text": rb.get("T6_promoted_ids", []) + rb.get("T6_refused_text", []),
+        "T4_T6_candidate_or_refused_text": rb.get("T4_T6_candidate_or_refused_text"),
+        "final_candidate_status": [((case.get("final_store") or {}).get("candidates") or {}).get(i, {}).get("status")
+                                   for i in ids],
+        "final_tool_outcome_records": [r.get("id") for r in ((case.get("final_store") or {}).get("records") or {}).values()
+                                       if r.get("type") == "tool_outcome"],
     }
 
 
@@ -736,16 +746,25 @@ c.check("W. C: the consolidation turn's act-loop request lists the agent's propo
         bool(cf["batch_requests"]) and any(k == "consolidation_reply" for _, k in cf["candidate_id_in"])
         and any(REFUSED_PREFIX in str(line) for line in cf["refused_text_line"]),
         {k: cf[k] for k in ("requests", "batch_requests", "candidate_id_in", "refused_text_line")})
-c.check("W. C: after the scripted `promote` decision the candidate is `promoted` and memory_records has a new "
-        "`tool_outcome` record in agent:openminion with the candidate's content (the refused arguments); the only "
-        "memory.write decisions in the run, if any, are recovery's (`memory-capture-recovery`)",
-        cf["state"] == "finished" and len(cf["new_tool_outcome_records"]) == 1
-        and cf["new_tool_outcome_records"][0].get("scope") == f"agent:{AGENT_ID}"
-        and cf["new_tool_outcome_records"][0].get("content_json") == cand_content
-        and [st for _, st in cf["candidate_status"]] == [["proposed", "promoted"]]
+applied = cf.get("decisions_applied") or [{}]
+apply_result = applied[0].get("result") or {}
+c.check("W. C: the scripted `promote` decision is parsed and applied to the selected batch, and the promotion policy "
+        "refuses it (`Source 'agent_inferred' requires explicit approval for auto-promotion`): the candidate stays "
+        "`proposed` and no `tool_outcome` record is written; the only memory.write decisions in the run, if any, "
+        "are recovery's (`memory-capture-recovery`)",
+        cf["state"] == "finished" and len(cf.get("decisions_applied") or []) == 1
+        and [d.get("candidate_id") for d in applied[0].get("decisions") or []] == w.get("tool_outcome_candidate_ids")
+        and set(w.get("tool_outcome_candidate_ids") or ["?"]) <= set(applied[0].get("selected_candidate_ids") or [])
+        and apply_result.get("promoted_count") == 0
+        and any("requires explicit approval for auto-promotion" in str(e) for e in apply_result.get("errors") or [])
+        and cf["final_candidate_status"] == ["proposed"] and cf["final_tool_outcome_records"] == []
         and set(cf["memory_write_targets"]) <= {"memory-capture-recovery"},
-        {k: cf[k] for k in ("state", "recovery", "signal_parsed", "decisions_applied", "candidate_status",
-                            "new_tool_outcome_records", "memory_write_targets")})
+        {k: cf[k] for k in ("state", "recovery", "signal_parsed", "decisions_applied", "final_candidate_status",
+                            "final_tool_outcome_records", "memory_write_targets")})
+c.check("W. the candidate is not shown to later ordinary turns: no T4, T5 or T6 request (sessions s2 and s3) holds its "
+        "id, the refused content or the refused key",
+        not cf.get("T4_T6_candidate_or_refused_text") and bool(w.get("tool_outcome_candidate_ids")),
+        cf.get("T4_T6_candidate_or_refused_text"))
 observed["consolidation_W"] = cf
 hosts = sorted({h for case in cases.values() for h in case.get("provider_hosts", [])})
 errors = {k: case.get("case_error") for k, case in cases.items() if case.get("case_error")}
