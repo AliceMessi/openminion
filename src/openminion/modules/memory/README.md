@@ -129,6 +129,13 @@ without it, such as the reference adapter, is reported with
 `CaptureRecoveryUnsupportedError`: the turn completes, its capture intent stays
 pending with `"error_code": "CAPTURE_RECOVERY_UNSUPPORTED"` in
 `memory_capture_bundle_result`, and pending-capture recovery leaves it pending.
+Recovery asks first, after the intent's identity and authorization checks: the
+memory API, the memory service, the audited store and the backend adapter
+answer `supports_capture_bundles()` with the same method check, without
+writing. While the configured backend cannot commit a bundle, recovery does not
+read the intent's source message or call the extraction model. A later
+recovery with a backend that implements the method recovers the intent. The
+backend itself needs no other method.
 
 ## CLI portability
 

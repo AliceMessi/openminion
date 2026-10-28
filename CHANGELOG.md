@@ -7,6 +7,22 @@ This file tracks package-facing release notes for `openminion`.
 
 ## Unreleased
 
+- Stop pending-capture recovery from calling the extraction model for an
+  intent that the current memory store cannot commit. After the identity and
+  authorization checks, recovery asks the memory owners whether the store can
+  commit an atomic capture bundle (`supports_capture_bundles()`, the existing
+  method check, now readable without a write). With a backend without
+  `apply_capture_bundle`, such as `reference-sqlite`, each intent stays pending
+  with its counts and `CAPTURE_RECOVERY_UNSUPPORTED` diagnostic, and no source
+  message is read and no extraction request is made; before, every memory
+  consolidation run extracted again for each pending intent up to its
+  `batch_limit`. The same intents are recovered once the agent uses a store
+  that can commit them. Under the audit wrapper, a store without the method,
+  such as the in-memory store, is now reported the same way; before, recovery
+  extracted and then raised `AttributeError`. A memory API without the new
+  predicate keeps the previous order, and the bundle write and its errors are
+  unchanged (Refs #449).
+
 ## Current package line - 2026-10-27
 
 - Document what `openminion storage backup` covers in a SQLite runtime home.
