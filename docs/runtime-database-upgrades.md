@@ -216,3 +216,42 @@ literal top-level string:
 - it compares a filter value that is not a string (other than a false value,
   which becomes `""`) as an SQL value, so `1` matches a stored `1` or `true`,
   where PostgreSQL raises `TypeError`.
+
+## PostgreSQL runtime storage
+
+With `storage.backend: postgres` and `storage.postgres_url` (or
+`OPENMINION_STORAGE_BACKEND=postgres` and `OPENMINION_STORAGE_POSTGRES_URL`),
+`APIRuntime` keeps its runtime record store (sessions, messages, events and
+room participants) in PostgreSQL. This section lists only the paths that
+`tests/integration/test_runtime_storage_postgres.py` checks against a
+PostgreSQL server; it is not a backend support matrix.
+
+Checked on PostgreSQL:
+
+- `APIRuntime.from_config_path` start and `close()`: no server connection is
+  left after `close()`, and no runtime SQLite database is created at
+  `storage.path`;
+- a session and a message written through `runtime.sessions` are in
+  PostgreSQL, and one echo-agent turn through `Agent(runtime=...)` completes
+  and stores its messages there;
+- `openminion room create`: the room and its owner participant row are in
+  PostgreSQL;
+- `OpenMinionRuntime.from_config_path` start and `close()`.
+
+SQLite only:
+
+- `APIRuntime.storage_connection` is the runtime record store's
+  `sqlite3.Connection` on SQLite, and `None` for any other backend;
+- the compatibility wrapper's `OpenMinionRuntime.storage` is the same value.
+
+The paths above reach the runtime database through `runtime_storage` and
+`sessions`, not through `storage_connection`.
+
+Not covered:
+
+- other runtime surfaces on PostgreSQL runtime storage;
+- `openminion storage migrate --backend postgres` and module PostgreSQL
+  migrations;
+- the module stores under the data root (for example `brain/sessions.db` and
+  `memory/memory.db`): they are SQLite files on both backends, because
+  `storage.backend` does not select them.

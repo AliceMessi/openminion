@@ -123,7 +123,11 @@ def finalize_runtime_instance(
         telemetry_service=infrastructure["telemetry_service"],
         telemetryctl=infrastructure.get("telemetryctl"),
         runtime_storage=runtime_storage,
-        storage_connection=runtime_storage.connection,
+        storage_connection=(
+            runtime_storage.connection
+            if base_config.storage.record_backend() == "record.sqlite"
+            else None
+        ),
         sessions=runtime_storage.sessions,
         idempotency=runtime_storage.idempotency,
         channels=infrastructure["channels"],
