@@ -88,6 +88,14 @@ def _resolve_explicit_namespace(
 
 
 class MemoryServiceMutationMixin:
+    def supports_capture_bundles(self) -> bool:
+        """Whether the memory store can commit an atomic capture bundle."""
+        from openminion.modules.memory.runtime.capture_bundle import (
+            capture_bundles_supported,
+        )
+
+        return capture_bundles_supported(self._store)
+
     def apply_capture_bundle(self, bundle: Any) -> Any:
         handler = getattr(self._store, "apply_capture_bundle", None)
         if not callable(handler):

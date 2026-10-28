@@ -8,6 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 from sophiagraph.audit.events import MemoryAuditEvent
 
 from openminion.modules.memory.errors import InvalidArgumentError
+from openminion.modules.memory.runtime.capture_bundle import capture_bundles_supported
 
 
 @runtime_checkable
@@ -186,6 +187,10 @@ class AuditedMemoryStore:
             )
         )
         return record_id
+
+    def supports_capture_bundles(self) -> bool:
+        """Whether the wrapped store can commit an atomic capture bundle."""
+        return capture_bundles_supported(self._store)
 
     def apply_capture_bundle(self, bundle: Any) -> Any:
         receipt = self._store.apply_capture_bundle(bundle)

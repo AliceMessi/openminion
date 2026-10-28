@@ -463,6 +463,10 @@ class BackendMemoryStoreAdapter(MemoryStore):
     def list_all(self):
         return _call_backend_extra(self._backend, "list_all")
 
+    def supports_capture_bundles(self) -> bool:
+        """Whether the backend has a callable ``apply_capture_bundle``."""
+        return callable(getattr(self._backend, "apply_capture_bundle", None))
+
     def apply_capture_bundle(self, bundle: Any) -> Any:
         """Apply an atomic capture bundle, which external backends may not offer.
 
@@ -471,13 +475,12 @@ class BackendMemoryStoreAdapter(MemoryStore):
         store without one, so the capture stays pending. An error raised by a
         backend's own ``apply_capture_bundle`` propagates unchanged.
         """
-        handler = getattr(self._backend, "apply_capture_bundle", None)
-        if not callable(handler):
+        if not self.supports_capture_bundles():
             raise CaptureRecoveryUnsupportedError(
                 f"memory backend {type(self._backend).__name__} does not support "
                 "atomic capture bundles"
             )
-        return handler(bundle)
+        return self._backend.apply_capture_bundle(bundle)
 
 
 def adapt_backend_to_store(

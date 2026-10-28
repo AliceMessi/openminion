@@ -8,6 +8,7 @@ from typing import Any, Callable
 from openminion.modules.memory.errors import (
     CaptureIdentityMismatchError,
     CaptureRecoveryUnauthorizedError,
+    CaptureRecoveryUnsupportedError,
     CaptureSourceUnavailableError,
 )
 from openminion.modules.session.capture import build_capture_identity
@@ -135,6 +136,13 @@ def _recover_capture(
         raise CaptureIdentityMismatchError("capture identity is not canonical")
     if not authorize(session.id, root_turn_id, identity.event_id, identity.capture_id):
         raise CaptureRecoveryUnauthorizedError("capture recovery is not authorized")
+    # Ask the current store before reading the source or calling the model. A
+    # memory API without this predicate leaves the bundle write to report it.
+    supports_capture_bundles = getattr(memctl, "supports_capture_bundles", None)
+    if callable(supports_capture_bundles) and not supports_capture_bundles():
+        raise CaptureRecoveryUnsupportedError(
+            "configured memory backend does not support atomic capture bundles"
+        )
     source_body = _capture_source_body(
         sessions=sessions,
         session_id=session.id,

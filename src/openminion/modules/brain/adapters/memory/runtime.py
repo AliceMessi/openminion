@@ -210,6 +210,20 @@ class MemctlAdapter:
         if callable(setter):
             setter(session_id=session_id, turn_id=turn_id)
 
+    def supports_capture_bundles(self) -> bool:
+        """Whether the memory service can commit an atomic capture bundle.
+
+        False without a callable ``apply_capture_bundle`` on the service, the
+        check ``apply_capture_bundle`` makes; otherwise the service's answer.
+        """
+        from openminion.modules.memory.runtime.capture_bundle import (
+            capture_bundles_supported,
+        )
+
+        return callable(self._capture_bundle_api) and capture_bundles_supported(
+            self._backend
+        )
+
     def apply_capture_bundle(
         self,
         *,

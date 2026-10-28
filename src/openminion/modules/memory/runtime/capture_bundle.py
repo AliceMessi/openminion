@@ -90,3 +90,15 @@ def capture_output_id(*, capture_id: str, normalized_key: str, ordinal: int) -> 
 
 def capture_result_hash(*, output_ids: tuple[str, ...], disposition: str) -> str:
     return _stable_hash({"output_ids": list(output_ids), "disposition": disposition})
+
+
+def capture_bundles_supported(owner: object) -> bool:
+    """Whether ``owner`` can commit an atomic capture bundle, without a write.
+
+    An owner that forwards the capability answers ``supports_capture_bundles()``.
+    Any other owner keeps the existing check: a callable ``apply_capture_bundle``.
+    """
+    supports = getattr(owner, "supports_capture_bundles", None)
+    if callable(supports):
+        return bool(supports())
+    return callable(getattr(owner, "apply_capture_bundle", None))
