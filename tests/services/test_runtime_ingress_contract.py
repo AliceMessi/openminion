@@ -245,6 +245,46 @@ def test_runtime_turn_request_rejects_public_subagent_authority(payload) -> None
         runtime_turn_request_from_payload(runtime=runtime, payload=payload)
 
 
+_PUBLIC_CONSOLIDATION_METADATA = {
+    "memory_consolidation_job": "true",
+    "memory_consolidation_target_scope": "agent:main",
+    "memory_consolidation_batch_limit": "15",
+    "memory_consolidation_max_iterations": "9",
+    "memory_consolidation_timeout_seconds": "600",
+    "cron_job_id": "job-public",
+}
+
+
+@pytest.mark.parametrize(
+    ("managed", "public"),
+    (
+        (False, {"inbound_metadata": _PUBLIC_CONSOLIDATION_METADATA}),
+        (True, {"meta": _PUBLIC_CONSOLIDATION_METADATA}),
+        (True, {"inbound_metadata": _PUBLIC_CONSOLIDATION_METADATA}),
+    ),
+)
+def test_public_consolidation_metadata_does_not_reach_the_gateway(
+    managed: bool, public: dict[str, object]
+) -> None:
+    runtime = _RuntimeStub()
+    payload = {"message": "hi", "session_id": "public", **public}
+    if managed:
+        request = runtime_turn_request_from_manager_request(
+            runtime=runtime,
+            request=build_manager_turn_request(payload, default_agent_id="main"),
+        )
+    else:
+        request = runtime_turn_request_from_payload(runtime=runtime, payload=payload)
+
+    execute_runtime_turn(runtime=runtime, request=request)
+
+    inbound_metadata = runtime.gateway.calls[0]["inbound_metadata"]
+    assert inbound_metadata["cron_job_id"] == "job-public"
+    assert [
+        key for key in inbound_metadata if key.startswith("memory_consolidation_")
+    ] == []
+
+
 def test_trusted_subagent_context_is_projected_after_public_parsing() -> None:
     runtime = _RuntimeStub()
     context = SimpleNamespace(
