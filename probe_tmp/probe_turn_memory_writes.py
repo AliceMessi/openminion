@@ -23,9 +23,11 @@ Steps in each case (every turn has an approval callback that records and denies)
       the model calls `memory_write` once; the approval callback denies it
   T4  `APIRuntime.run_turn`, session s2, conversation `chat`: "Say hello."
   T5  `APIRuntime.run_turn`, session s2, conversation `chat`: the question
-  C   one memory consolidation run (daemon TaskManager + cron scheduler); the
-      scripted consolidation reply promotes the `tool_outcome` candidate only if
-      the candidate id is in the request it answers
+  C   one memory consolidation run (daemon TaskManager + cron scheduler). The
+      scripted model routes the consolidation turn into the act loop (entry
+      `decompose` with no subtasks); if the request it then answers contains the
+      `tool_outcome` candidate id, it replies with a `memory_consolidation`
+      trailer that promotes that candidate (a real model may decide otherwise)
   T6  SDK `Agent.run`, session s3: "Say hello."
 After T1, the case also asks recovery's gate for T1's capture and the turn's
 tool adapter for `memory.write`.
@@ -127,6 +129,7 @@ class TurnProvider(ScriptedProvider):
         self.texts: list[str] = []
         self.write_tool_call = False
         self.promote_candidate_id: str | None = None
+        self.consolidation_entry_done = False
         super().__init__()
 
     def respond(self, body: dict[str, Any], path: str) -> dict[str, Any]:
@@ -151,6 +154,11 @@ class TurnProvider(ScriptedProvider):
                 self.write_tool_call = False
             elif self.promote_candidate_id and self.promote_candidate_id in txt:
                 kind = "consolidation_reply"
+            elif (CONSOLIDATION_MESSAGE in last_user and "decompose" in names
+                  and not self.consolidation_entry_done):
+                # Route the consolidation turn into the act loop, which shows the candidate batch.
+                kind = "consolidation_entry"
+                self.consolidation_entry_done = True
             elif CONSOLIDATION_MESSAGE in last_user:
                 kind = "consolidation_other"
             elif "purpose: decide" in txt:
@@ -161,6 +169,7 @@ class TurnProvider(ScriptedProvider):
             self.requests.append({"index": index, "kind": kind, "path": path, "model": body.get("model"),
                                   "tools": sorted(n for n in names if n), "forced": forced or None,
                                   "decision_memory_section": "[DECISION MEMORY]" in txt,
+                                  "consolidation_batch": "[MEMORY CONSOLIDATION CANDIDATES]" in txt,
                                   "t": time.monotonic()})
             self.texts.append(txt)
         if kind == "extraction":
@@ -179,6 +188,10 @@ class TurnProvider(ScriptedProvider):
         if kind == "tool_call":
             call = {"id": f"call-memory-write-{index}", "type": "function",
                     "function": {"name": "memory_write", "arguments": json.dumps(TOOL_ARGS)}}
+            return lib._completion({"role": "assistant", "content": None, "tool_calls": [call]}, "tool_calls")
+        if kind == "consolidation_entry":
+            call = {"id": f"call-decompose-{index}", "type": "function",
+                    "function": {"name": "decompose", "arguments": json.dumps({"subtasks": []})}}
             return lib._completion({"role": "assistant", "content": None, "tool_calls": [call]}, "tool_calls")
         if kind == "consolidation_reply":
             signal = {"decisions": [{"candidate_id": self.promote_candidate_id, "action": "promote",
@@ -641,6 +654,49 @@ for label, case, constraint in (("N", n, [NEUTRAL_CONSTRAINT]), ("X", x, [])):
             and decisions_ok(case) and tool_outcome_ok(case) and shape(case) == shape(w),
             {"constraints": case.get("identity_constraints"), "recovery_gate": crg.get("returned"),
              "tool_adapter": case.get("tool_adapter_memory_write"), "shape_equals_W": shape(case) == shape(w)})
+
+
+def consolidation_facts(case: dict[str, Any]) -> dict[str, Any]:
+    cons = case.get("consolidation") or {}
+    a, b = cons.get("request_range") or [0, 0]
+    log = (case.get("request_log") or [])[a:b]
+    rb = case.get("readback") or {}
+    ids = case.get("tool_outcome_candidate_ids") or []
+    store = cons.get("store") or {}
+    return {
+        "state": cons.get("state"), "recovery": cons.get("recovery"),
+        "requests": [r.get("kind") for r in log],
+        "batch_requests": [r.get("index") for r in log if r.get("consolidation_batch")],
+        "candidate_id_in": [[h.get("request"), h.get("kind")] for h in rb.get("C_candidate_id", [])],
+        "refused_text_line": [h.get("line") for h in rb.get("C_refused_text", [])],
+        "candidate_status": [[c.get("id"), c["fields"].get("status")] for c in store.get("changed_candidates", [])
+                             if c.get("id") in ids],
+        "new_tool_outcome_records": [{k: r.get(k) for k in ("id", "scope", "type", "title", "content_json", "source")}
+                                     for r in store.get("new_records", []) if r.get("type") == "tool_outcome"],
+        "memory_write_targets": sorted({d.get("target") for d in cons.get("memory_write_decisions", [])}),
+        "T6_promoted_or_refused_text": rb.get("T6_promoted_ids", []) + rb.get("T6_refused_text", []),
+    }
+
+
+cf = consolidation_facts(w)
+cand_content = ((tool_outcome_facts(w)["candidates"] or [{}])[0]).get("content_json")
+c.check("W. C: the consolidation turn's act-loop request lists the agent's proposed candidates "
+        "([MEMORY CONSOLIDATION CANDIDATES]); the `tool_outcome` candidate is there with its id, and its preview "
+        "holds the refused content",
+        bool(cf["batch_requests"]) and any(k == "consolidation_reply" for _, k in cf["candidate_id_in"])
+        and any(REFUSED_TEXT in str(line) for line in cf["refused_text_line"]),
+        {k: cf[k] for k in ("requests", "batch_requests", "candidate_id_in", "refused_text_line")})
+c.check("W. C: after the scripted `promote` decision the candidate is `promoted` and memory_records has a new "
+        "`tool_outcome` record in agent:openminion with the candidate's content (the refused arguments); the only "
+        "memory.write decisions in the run, if any, are recovery's (`memory-capture-recovery`)",
+        cf["state"] == "finished" and len(cf["new_tool_outcome_records"]) == 1
+        and cf["new_tool_outcome_records"][0].get("scope") == f"agent:{AGENT_ID}"
+        and cf["new_tool_outcome_records"][0].get("content_json") == cand_content
+        and [st for _, st in cf["candidate_status"]] == [["proposed", "promoted"]]
+        and set(cf["memory_write_targets"]) <= {"memory-capture-recovery"},
+        {k: cf[k] for k in ("state", "recovery", "candidate_status", "new_tool_outcome_records",
+                            "memory_write_targets")})
+observed["consolidation_W"] = cf
 hosts = sorted({h for case in cases.values() for h in case.get("provider_hosts", [])})
 errors = {k: case.get("case_error") for k, case in cases.items() if case.get("case_error")}
 c.check("Offline provider and no case error: every case's openai base URL is the scripted server on 127.0.0.1",
