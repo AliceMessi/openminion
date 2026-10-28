@@ -109,6 +109,16 @@ class RuntimeSessionStoreParticipants:
         if session is None:
             return None
         self.ensure_legacy_participant_record(session)
+        return self._find_active_participant(
+            session_id, participant_type, participant_id
+        )
+
+    def _find_active_participant(
+        self,
+        session_id: str,
+        participant_type: str,
+        participant_id: str,
+    ) -> RoomParticipant | None:
         row = self._backend.query_one(
             f"""
             SELECT {PARTICIPANT_COLUMNS}
@@ -212,26 +222,31 @@ class RuntimeSessionStoreParticipants:
         normalized_agent = normalize_identity(agent_id)
         if not normalized_agent:
             raise ValueError("agent_id is required")
-        participant = self.get_participant(
-            session_id,
-            "agent",
-            normalized_agent,
-        )
-        if participant is None:
-            legacy_agent = agent_id_from_session_key(session.session_key)
-            if legacy_agent and legacy_agent != normalized_agent:
-                raise ValueError(
-                    f"Legacy session {session_id!r} is bound to agent {legacy_agent!r}"
-                )
-            if not legacy_agent:
-                raise ValueError(
-                    f"Agent {normalized_agent!r} is not an active participant"
-                )
-        now = utc_now_iso()
-        self._backend.execute_count(
-            "UPDATE sessions SET active_agent_id = ?, updated_at = ? WHERE id = ?",
-            (normalized_agent, now, session_id),
-        )
+        self.ensure_legacy_participant_record(session)
+        with self._backend.transaction():
+            # The participant check and the write hold the session-row lock,
+            # as joins and leaves do, so a leave cannot commit between them.
+            self._lock_session_row(session_id)
+            participant = self._find_active_participant(
+                session_id,
+                "agent",
+                normalized_agent,
+            )
+            if participant is None:
+                legacy_agent = agent_id_from_session_key(session.session_key)
+                if legacy_agent and legacy_agent != normalized_agent:
+                    raise ValueError(
+                        f"Legacy session {session_id!r} is bound to agent {legacy_agent!r}"
+                    )
+                if not legacy_agent:
+                    raise ValueError(
+                        f"Agent {normalized_agent!r} is not an active participant"
+                    )
+            now = utc_now_iso()
+            self._backend.execute_count(
+                "UPDATE sessions SET active_agent_id = ?, updated_at = ? WHERE id = ?",
+                (normalized_agent, now, session_id),
+            )
         updated = self._get_session(session_id)
         if updated is None:
             raise RuntimeError(f"Failed to update active agent for {session_id}")
