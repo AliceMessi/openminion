@@ -7,6 +7,18 @@ This file tracks package-facing release notes for `openminion`.
 
 ## Unreleased
 
+- Give a scheduled memory consolidation turn its job's consolidation context
+  and keep it out of its own memory capture. The gateway dropped the
+  `memory_consolidation_*` metadata the cron executor set, so the turn
+  extracted memory candidates from its own message, captured it, and got no
+  candidates to review; on a memory backend without atomic capture each run
+  added a pending capture intent. The cron executor now attaches the job's
+  target scope, batch limit, iteration limit and timeout to its own turn
+  request as a typed context, which runtime ingress passes to the brain. A
+  caller's `meta` or `inbound_metadata` cannot set these keys: ingress drops
+  them, and a `cron_job_id` or `cron_run_id` does not stand in for the
+  context (Refs #456).
+
 ## Current package line - 2026-10-27
 
 - Document what `openminion storage backup` covers in a SQLite runtime home.
