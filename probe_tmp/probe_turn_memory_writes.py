@@ -106,6 +106,8 @@ HELLO = "Say hello."
 TOOL_ARGS = {"record_type": "fact", "key": "fact:indentation", "title": "Indentation",
              "content": "The user prefers tabs."}
 REFUSED_TEXT = TOOL_ARGS["content"]
+# The consolidation preview is cut at 220 characters, inside the refused content.
+REFUSED_PREFIX = '"content":"The user prefers'
 CANONICAL_ARGS = json.dumps(TOOL_ARGS, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 c = Checks()
 
@@ -285,6 +287,48 @@ class Recorder:
         self._undo.clear()
 
 
+class ConsolidationRecorder:
+    """Call-through recorders on the consolidation signal parser and the decision applier."""
+
+    def __init__(self) -> None:
+        import openminion.modules.brain.loop.adaptive.modes as modes
+        import openminion.modules.brain.loop.tools.runtime as loop_runtime
+
+        self.parsed: list[dict[str, Any]] = []
+        self.applied: list[dict[str, Any]] = []
+        self._undo = [(modes, "apply_memory_consolidation_decisions",
+                       modes.apply_memory_consolidation_decisions),
+                      (loop_runtime, "_normalize_memory_consolidation_response",
+                       loop_runtime._normalize_memory_consolidation_response)]
+        parse, apply = self._undo[1][2], self._undo[0][2]
+
+        def parse_rec(response: Any) -> Any:
+            out = parse(response)
+            text = str(getattr(response, "output_text", "") or "")
+            if "<memory_consolidation>" in text:
+                self.parsed.append({"signal": getattr(out, "memory_consolidation", None)})
+            return out
+
+        def apply_rec(*args: Any, **kwargs: Any) -> Any:
+            row: dict[str, Any] = {k: kwargs.get(k) for k in ("decisions", "target_scope", "selected_candidate_ids")}
+            try:
+                result = apply(*args, **kwargs)
+                row["result"] = result
+                return result
+            except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+                row["raised"] = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                self.applied.append(row)
+
+        modes.apply_memory_consolidation_decisions = apply_rec
+        loop_runtime._normalize_memory_consolidation_response = parse_rec
+
+    def uninstall(self) -> None:
+        for module, name, original in self._undo:
+            setattr(module, name, original)
+
+
 # ---------------------------------------------------------------- store
 def _db_path(obs: Any) -> Path | None:
     store = obs.assembly.service._store
@@ -339,12 +383,12 @@ def diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- helpers
 def id_hits(provider: TurnProvider, start: int, end: int, needle: str) -> list[dict[str, Any]]:
-    """Requests in [start, end) whose text contains `needle`, with the line that holds it."""
+    """Requests in [start, end) whose text contains `needle`, with that line and the next two."""
     hits = []
     for index in range(start, end):
         text = provider.texts[index]
         if needle and needle in text:
-            match = re.search(r"[^\n]{0,80}" + re.escape(needle) + r"[^\n]{0,240}", text)
+            match = re.search(r"[^\n]{0,80}" + re.escape(needle) + r"[^\n]{0,240}(?:\n[^\n]{0,240}){0,2}", text)
             hits.append({"request": index, "kind": provider.requests[index]["kind"],
                          "line": match.group(0) if match else None})
     return hits
@@ -440,7 +484,7 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
     provider = TurnProvider()
     old_env = chdir_env(root)
     row: dict[str, Any] = {"case": label, "constraint": constraint}
-    runtime = obs = rec = cron = None
+    runtime = obs = rec = cron = crec = None
     try:
         runtime = build_runtime(root, provider, identity_constraint=constraint)
         obs = Observers(runtime).install()
@@ -450,6 +494,7 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
         row["identity_constraints"] = list(getattr(obs.security_policy, "_identity_constraints", []) or [])
         row["security_policy_present"] = obs.security_policy is not None
         rec = Recorder(memory_api, obs.security_policy)
+        crec = ConsolidationRecorder()
         ctx = {"provider": provider, "rec": rec, "obs": obs, "runtime": runtime, "db": _db_path(obs)}
         row["memory_db"] = ctx["db"].name if ctx["db"] is not None else None
         turns = row["turns"] = {}
@@ -477,6 +522,8 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
         cron.start()
         provider.promote_candidate_id = tool_outcomes[0]["candidate_id"] if tool_outcomes else None
         row["consolidation"] = consolidation(ctx, row["job_id"])
+        row["consolidation"]["signal_parsed"] = list(crec.parsed)
+        row["consolidation"]["decisions_applied"] = list(crec.applied)
         provider.promote_candidate_id = None
         turns["T6"] = sdk_turn(ctx, "T6", HELLO, "s3")
         row["final_store"] = snapshot(ctx["db"])
@@ -495,7 +542,7 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
                                           for h in id_hits(provider, a, b, d)]
         a, b = row["consolidation"]["request_range"]
         readback["C_candidate_id"] = [h for d in row["tool_outcome_candidate_ids"] for h in id_hits(provider, a, b, d)]
-        readback["C_refused_text"] = id_hits(provider, a, b, REFUSED_TEXT)
+        readback["C_refused_text"] = id_hits(provider, a, b, REFUSED_PREFIX)
         a, b = turns["T6"]["request_range"]
         readback["T6_promoted_ids"] = [h for d in promoted for h in id_hits(provider, a, b, d)]
         readback["T6_refused_text"] = id_hits(provider, a, b, REFUSED_TEXT)
@@ -513,6 +560,8 @@ def run_case(label: str, constraint: str | None) -> dict[str, Any]:
                 cron.stop()
             except Exception as exc:  # noqa: BLE001
                 row["scheduler_stop"] = f"{type(exc).__name__}: {exc}"
+        if crec is not None:
+            crec.uninstall()
         if rec is not None:
             rec.uninstall()
         if obs is not None:
@@ -674,6 +723,7 @@ def consolidation_facts(case: dict[str, Any]) -> dict[str, Any]:
         "new_tool_outcome_records": [{k: r.get(k) for k in ("id", "scope", "type", "title", "content_json", "source")}
                                      for r in store.get("new_records", []) if r.get("type") == "tool_outcome"],
         "memory_write_targets": sorted({d.get("target") for d in cons.get("memory_write_decisions", [])}),
+        "signal_parsed": cons.get("signal_parsed"), "decisions_applied": cons.get("decisions_applied"),
         "T6_promoted_or_refused_text": rb.get("T6_promoted_ids", []) + rb.get("T6_refused_text", []),
     }
 
@@ -682,9 +732,9 @@ cf = consolidation_facts(w)
 cand_content = ((tool_outcome_facts(w)["candidates"] or [{}])[0]).get("content_json")
 c.check("W. C: the consolidation turn's act-loop request lists the agent's proposed candidates "
         "([MEMORY CONSOLIDATION CANDIDATES]); the `tool_outcome` candidate is there with its id, and its preview "
-        "holds the refused content",
+        "holds the start of the refused content",
         bool(cf["batch_requests"]) and any(k == "consolidation_reply" for _, k in cf["candidate_id_in"])
-        and any(REFUSED_TEXT in str(line) for line in cf["refused_text_line"]),
+        and any(REFUSED_PREFIX in str(line) for line in cf["refused_text_line"]),
         {k: cf[k] for k in ("requests", "batch_requests", "candidate_id_in", "refused_text_line")})
 c.check("W. C: after the scripted `promote` decision the candidate is `promoted` and memory_records has a new "
         "`tool_outcome` record in agent:openminion with the candidate's content (the refused arguments); the only "
@@ -694,8 +744,8 @@ c.check("W. C: after the scripted `promote` decision the candidate is `promoted`
         and cf["new_tool_outcome_records"][0].get("content_json") == cand_content
         and [st for _, st in cf["candidate_status"]] == [["proposed", "promoted"]]
         and set(cf["memory_write_targets"]) <= {"memory-capture-recovery"},
-        {k: cf[k] for k in ("state", "recovery", "candidate_status", "new_tool_outcome_records",
-                            "memory_write_targets")})
+        {k: cf[k] for k in ("state", "recovery", "signal_parsed", "decisions_applied", "candidate_status",
+                            "new_tool_outcome_records", "memory_write_targets")})
 observed["consolidation_W"] = cf
 hosts = sorted({h for case in cases.values() for h in case.get("provider_hosts", [])})
 errors = {k: case.get("case_error") for k, case in cases.items() if case.get("case_error")}
