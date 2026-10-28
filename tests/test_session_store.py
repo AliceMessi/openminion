@@ -36,6 +36,10 @@ from tests._room_participant_scenarios import (
     check_leave_and_rejoin_wait_for_each_other,
     check_joins_write_no_session_value,
     check_legacy_owner_join_order,
+    check_legacy_session_selection,
+    check_selection_and_leave_one_after_another,
+    check_selection_during_a_leave_is_refused,
+    check_selection_held_before_its_write_applies_before_a_leave,
     check_tied_join_order,
 )
 from tests._run_status_scenarios import (
@@ -2005,3 +2009,29 @@ class SessionStoreTests(unittest.TestCase):
             self.store.set_active_agent(
                 session_id=room.id, agent_id="non-existent-agent"
             )
+
+    def _check_selection_on_two_connections(self, check) -> None:
+        selector, leaver = (build_runtime_storage(self.database_path) for _ in range(2))
+        try:
+            check(self.store, selector.sessions, leaver.sessions)
+        finally:
+            selector.close()
+            leaver.close()
+
+    def test_selection_held_before_its_write_applies_before_a_leave(self) -> None:
+        self._check_selection_on_two_connections(
+            check_selection_held_before_its_write_applies_before_a_leave
+        )
+
+    def test_selection_during_a_leave_is_refused(self) -> None:
+        self._check_selection_on_two_connections(
+            check_selection_during_a_leave_is_refused
+        )
+
+    def test_selection_and_leave_one_after_another(self) -> None:
+        self._check_selection_on_two_connections(
+            check_selection_and_leave_one_after_another
+        )
+
+    def test_legacy_session_selection(self) -> None:
+        check_legacy_session_selection(self.store)

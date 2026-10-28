@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -414,3 +415,215 @@ def check_upgraded_join_order(sessions: SessionStore, counted: dict[str, int]) -
     join_agents(sessions, "room-b", ("b-new",), ids="3")
     assert participant_ids(sessions, "room-b") == ["b-first", "b-new", "b-later"]
     assert join_seq_by_participant(sessions, "room-b")["b-new"] == 3
+
+
+# A selection against a leave of the agent it selects, on two connections:
+# `set_active_agent` checks the participant and writes the active agent under
+# the session-row lock, so a leave either waits for the selection and then
+# runs its fallback, or commits first and the selection is refused.
+
+# How long a held call keeps the other connection's call waiting before the
+# test lets it go: below the 5 s SQLite busy timeout of the runtime storages.
+SELECTION_HOLD_SECONDS = 1.0
+SELECTION_HOLD_TIMEOUT = 10
+SELECTION_WRITE = "UPDATE sessions SET active_agent_id"
+
+
+def selection_room(sessions: SessionStore, target: str) -> str:
+    """A room with a human owner, then `alpha` (active) and `beta`."""
+    room = sessions.create_room(channel="cli", target=target)
+    sessions.add_participant(
+        session_id=room.id,
+        participant_type="human",
+        participant_id="owner",
+        role="owner",
+    )
+    for agent in ("alpha", "beta"):
+        sessions.add_participant(
+            session_id=room.id, participant_type="agent", participant_id=agent
+        )
+    return room.id
+
+
+def listed_agents(sessions: SessionStore, session_id: str) -> list[str]:
+    return [
+        item.participant_id
+        for item in sessions.list_participants(session_id)
+        if item.participant_type == "agent"
+    ]
+
+
+def stored_selection(sessions: SessionStore, session_id: str) -> str | None:
+    session = sessions.get_session(session_id)
+    assert session is not None
+    return session.active_agent_id
+
+
+@contextmanager
+def held_selection_write(peer: SessionStore) -> Iterator[threading.Event]:
+    """Hold the next selection on `peer` when it sends its active-agent write.
+
+    Yields the event set when the selection is held: its participant check
+    has passed and its `UPDATE sessions SET active_agent_id` has not run.
+    The selection goes on when the context exits.
+    """
+    backend = peer._participants._backend
+    execute_count = backend.execute_count
+    held, release = threading.Event(), threading.Event()
+
+    def execute_count_held_before_the_write(sql: str, params: Any = None) -> int:
+        if sql.lstrip().startswith(SELECTION_WRITE) and not held.is_set():
+            held.set()
+            assert release.wait(timeout=SELECTION_HOLD_TIMEOUT)
+        return execute_count(sql, params)
+
+    with patch.object(backend, "execute_count", execute_count_held_before_the_write):
+        try:
+            yield held
+        finally:
+            release.set()
+
+
+def check_selection_held_before_its_write_applies_before_a_leave(
+    sessions: SessionStore, selector: SessionStore, leaver: SessionStore
+) -> None:
+    """`beta` is selected on one connection and leaves on the other.
+
+    The selection is held after its participant check, before its write, and
+    `beta` then leaves. The leave waits for the selection to commit, finds
+    `beta` active and runs its fallback. Before, the leave returned during the
+    hold and the selection then stored `beta`, which had left.
+    """
+    room_id = selection_room(sessions, "selection-before-leave")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with held_selection_write(selector) as held:
+            selection = pool.submit(
+                selector.set_active_agent, session_id=room_id, agent_id="beta"
+            )
+            assert held.wait(timeout=SELECTION_HOLD_TIMEOUT)
+            leave = pool.submit(
+                leaver.remove_participant,
+                session_id=room_id,
+                participant_type="agent",
+                participant_id="beta",
+            )
+            done, _ = wait([leave], timeout=SELECTION_HOLD_SECONDS)
+        selection.result(timeout=30)
+        assert leave.result(timeout=30) is True
+
+    # The agents listed, and the stored active agent.
+    outcome = (listed_agents(sessions, room_id), stored_selection(sessions, room_id))
+    assert outcome == (["alpha"], "alpha"), outcome
+    assert sessions.get_active_agent(room_id) == "alpha"
+    assert not done, "the leave did not wait for the held selection"
+
+
+def check_selection_during_a_leave_is_refused(
+    sessions: SessionStore, selector: SessionStore, leaver: SessionStore
+) -> None:
+    """`beta` leaves on one connection and is selected on the other.
+
+    The leave is held after it marked `beta` as left, before its fallback, in
+    its open transaction, and `beta` is then selected. The selection waits for
+    the leave to commit and is refused. Before, the selection's check passed
+    during the hold and its write stored `beta` after the leave committed.
+    """
+    room_id = selection_room(sessions, "leave-before-selection")
+    owner = leaver._participants
+    get_active_agent = owner.get_active_agent
+    marked_left, release = threading.Event(), threading.Event()
+
+    def get_active_agent_held_after_marking_left(session_id: str) -> str | None:
+        if not marked_left.is_set():
+            marked_left.set()
+            assert release.wait(timeout=SELECTION_HOLD_TIMEOUT)
+        return get_active_agent(session_id)
+
+    def select_beta() -> str | None:
+        try:
+            selected = selector.set_active_agent(session_id=room_id, agent_id="beta")
+        except ValueError as exc:
+            assert "not an active participant" in str(exc), exc
+            return "refused"
+        return selected.active_agent_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            with patch.object(
+                owner, "get_active_agent", get_active_agent_held_after_marking_left
+            ):
+                leave = pool.submit(
+                    leaver.remove_participant,
+                    session_id=room_id,
+                    participant_type="agent",
+                    participant_id="beta",
+                )
+                assert marked_left.wait(timeout=SELECTION_HOLD_TIMEOUT)
+                selection = pool.submit(select_beta)
+                done, _ = wait([selection], timeout=SELECTION_HOLD_SECONDS)
+                release.set()
+                assert leave.result(timeout=30) is True
+        finally:
+            release.set()
+        selected = selection.result(timeout=30)
+
+    # What the selection returned, the agents listed, and the stored agent.
+    outcome = (
+        selected,
+        listed_agents(sessions, room_id),
+        stored_selection(sessions, room_id),
+    )
+    assert outcome == ("refused", ["alpha"], "alpha"), outcome
+    assert not done, "the selection did not wait for the held leave"
+
+
+def check_selection_and_leave_one_after_another(
+    sessions: SessionStore, selector: SessionStore, leaver: SessionStore
+) -> None:
+    """A selection, then a leave, then a selection, on two connections."""
+    room_id = selection_room(sessions, "selection-then-leave")
+    selected = selector.set_active_agent(session_id=room_id, agent_id="beta")
+    assert selected.active_agent_id == "beta"
+    assert leaver.get_active_agent(room_id) == "beta"
+
+    # The active agent leaving selects the earliest remaining agent join.
+    assert leaver.remove_participant(
+        session_id=room_id, participant_type="agent", participant_id="beta"
+    )
+    assert listed_agents(sessions, room_id) == ["alpha"]
+    assert stored_selection(sessions, room_id) == "alpha"
+
+    # An agent that left cannot be selected.
+    with pytest.raises(ValueError, match="not an active participant"):
+        selector.set_active_agent(session_id=room_id, agent_id="beta")
+    assert stored_selection(sessions, room_id) == "alpha"
+    selected = selector.set_active_agent(session_id=room_id, agent_id="alpha")
+    assert selected.active_agent_id == "alpha"
+
+
+def check_legacy_session_selection(sessions: SessionStore) -> None:
+    """A legacy session keeps its selection rules.
+
+    Another agent is refused until it joins; the session's own agent can be
+    selected, also after its owner record has left.
+    """
+    session = sessions.resolve_session(
+        agent_id="legacy-agent", channel="console", target="legacy-selection"
+    )
+    with pytest.raises(ValueError, match="bound to agent 'legacy-agent'"):
+        sessions.set_active_agent(session_id=session.id, agent_id="other-agent")
+
+    sessions.add_participant(
+        session_id=session.id, participant_type="agent", participant_id="guest-agent"
+    )
+    selected = sessions.set_active_agent(session_id=session.id, agent_id="guest-agent")
+    assert selected.active_agent_id == "guest-agent"
+    selected = sessions.set_active_agent(session_id=session.id, agent_id="legacy-agent")
+    assert selected.active_agent_id == "legacy-agent"
+
+    assert sessions.remove_participant(
+        session_id=session.id, participant_type="agent", participant_id="legacy-agent"
+    )
+    assert participant_ids(sessions, session.id) == ["guest-agent"]
+    selected = sessions.set_active_agent(session_id=session.id, agent_id="legacy-agent")
+    assert selected.active_agent_id == "legacy-agent"

@@ -42,6 +42,10 @@ from tests._room_participant_scenarios import (
     check_leave_and_rejoin_wait_for_each_other,
     check_joins_write_no_session_value,
     check_legacy_owner_join_order,
+    check_legacy_session_selection,
+    check_selection_and_leave_one_after_another,
+    check_selection_during_a_leave_is_refused,
+    check_selection_held_before_its_write_applies_before_a_leave,
     check_tied_join_order,
     check_upgraded_join_order,
     legacy_participant_rows,
@@ -923,6 +927,47 @@ def test_postgres_leave_and_rejoin_on_two_connections_wait_for_each_other(
         finally:
             leaver.close()
             joiner.close()
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "check",
+    [
+        check_selection_held_before_its_write_applies_before_a_leave,
+        check_selection_during_a_leave_is_refused,
+        check_selection_and_leave_one_after_another,
+    ],
+    ids=["selection-before-leave", "leave-before-selection", "one-after-another"],
+)
+def test_postgres_selection_and_leave_on_two_connections(
+    tmp_path: Path,
+    check: Callable[[SessionStore, SessionStore, SessionStore], None],
+) -> None:
+    pytest.importorskip("sqlalchemy")
+    with _postgres_schema("om_selection_leave") as url:
+        selector, leaver = (
+            build_runtime_storage(
+                tmp_path / f"state/{name}.db",
+                env={},
+                record_backend="record.postgres",
+                record_backend_options={"url": url},
+            )
+            for name in ("selector", "leaver")
+        )
+        try:
+            with _postgres_sessions(tmp_path, url) as sessions:
+                check(sessions, selector.sessions, leaver.sessions)
+        finally:
+            selector.close()
+            leaver.close()
+
+
+@pytest.mark.postgres
+def test_postgres_legacy_session_selection(tmp_path: Path) -> None:
+    pytest.importorskip("sqlalchemy")
+    with _postgres_schema("om_selection_legacy") as url:
+        with _postgres_sessions(tmp_path, url) as sessions:
+            check_legacy_session_selection(sessions)
 
 
 @pytest.mark.postgres
