@@ -166,12 +166,12 @@ def test_bridge_asks_with_the_turn_channel_session_and_root_turn() -> None:
         runtime_session_id="runtime-session", root_turn_id="run-1"
     )
 
-    assert not bridge._memory_capture_authorized(
+    assert not bridge._turn_memory_write_allowed(
         message=_message(**gateway_ids), session_id="brain-session"
     )
     # Without the gateway's ids, the brain session id and no root turn.
     policy.update_identity_constraints([])
-    assert bridge._memory_capture_authorized(
+    assert bridge._turn_memory_write_allowed(
         message=_message(), session_id="brain-session"
     )
 
@@ -190,25 +190,31 @@ def test_bridge_asks_with_the_turn_channel_session_and_root_turn() -> None:
     [{"memory_consolidation_job": "true"}, {"diagnostic_scope": "runtime"}],
     ids=["excluded", "disabled"],
 )
-def test_bridge_does_not_authorize_a_turn_without_capture(
+def test_bridge_asks_for_a_turn_without_capture(
     metadata: dict[str, str],
 ) -> None:
-    policy = _RecordingPolicy()
+    # The turn's optional memory writes need the answer itself (#496); its
+    # capture stays unauthorized (`_prepare_turn`).
+    policy = _RecordingPolicy(identity_constraints=["NEVER write memory records"])
     bridge = _Bridge(policy=policy, tools=_tools())
 
-    assert not bridge._memory_capture_authorized(
+    assert not bridge._turn_memory_write_allowed(
         message=_message(**metadata), session_id="brain-session"
     )
-    assert policy.checks == []
+    policy.update_identity_constraints([])
+    assert bridge._turn_memory_write_allowed(
+        message=_message(**metadata), session_id="brain-session"
+    )
+    assert [d.decision for d in policy.decisions] == ["require_approval", "allow"]
 
 
 def test_bridge_with_a_policy_and_no_tools_does_not_authorize() -> None:
     policy = _RecordingPolicy()
 
-    assert not _Bridge(policy=policy, tools=None)._memory_capture_authorized(
+    assert not _Bridge(policy=policy, tools=None)._turn_memory_write_allowed(
         message=_message(), session_id="brain-session"
     )
-    assert _Bridge(policy=None, tools=None)._memory_capture_authorized(
+    assert _Bridge(policy=None, tools=None)._turn_memory_write_allowed(
         message=_message(), session_id="brain-session"
     )
     assert policy.checks == []

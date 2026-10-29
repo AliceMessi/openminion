@@ -685,9 +685,11 @@ def test_recovery_commits_a_denied_turn_capture_once_the_write_is_allowed(
         assert "extraction" not in provider.requests[mark:]
         assert _results(runtime, intent["capture_id"]) == []
         restricted = ("require_approval", "identity_hard_constraint_restricted")
+        # The consolidation turn asks its own memory.write question too (#496).
         assert [(d[0], d[1], *d[4:]) for d in recorder.decisions] == [
             ("console", "memory-capture", *restricted),
             ("cron", "memory-capture-recovery", *restricted),
+            ("console", "memory-capture", *restricted),
         ]
     finally:
         runtime.close()
@@ -810,11 +812,14 @@ def test_each_service_turn_sets_the_capture_decision_on_the_reused_runner(
         (True, False),
         (True, True),
     ]
-    # Excluded and disabled turns ask nothing; the others ask once each.
+    # Every turn asks once; excluded and disabled turns too, for their other
+    # memory writes (#496), and their capture stays unauthorized.
     assert [d[4] for d in recorder.decisions if d[1] == "memory-capture"] == [
         "allow",
         "allow",
+        "allow",
         "require_approval",
+        "allow",
         "allow",
         "allow",
     ]

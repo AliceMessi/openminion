@@ -871,6 +871,41 @@ def test_prepare_tool_dispatch_confirmation_stages_policy_denied_tool_outcome() 
         assert entries[0]["confidence"] == 0.4
 
 
+def test_tool_outcome_is_not_staged_when_the_turn_may_not_write_memory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        runner, session = _build_runner(Path(tmp), policy_api=ConfirmPolicyAdapter())
+        runner._memory_write_allowed_for_turn = False
+        state = runner._load_or_init_state("s-tool-outcome-not-authorized")
+        logger = CanonicalEventLogger(
+            session_api=session,
+            session_id="s-tool-outcome-not-authorized",
+            agent_id=runner.profile.agent_id,
+        )
+        command = ToolCommand(
+            command_id="cmd-tool-not-authorized",
+            title="Tool call: echo",
+            tool_name="echo",
+            args={"msg": "hi"},
+            success_criteria={"status": "success"},
+        )
+
+        prepared = RunnerCommandExecutor(runner).prepare_tool_dispatch(
+            state=state,
+            command=command,
+            logger=logger,
+        )
+
+        assert isinstance(prepared, PrepareOutcome)
+        assert prepared.action_result.status == "needs_user"
+        assert [
+            entry
+            for entry in _memory_entries(runner)
+            if entry.get("kind") == "candidate"
+        ] == []
+        assert state.memory_candidates == []
+        assert "staged_count" not in state.module_state.get("tool_outcome_memory", {})
+
+
 def test_tool_outcome_staging_is_bounded_per_turn() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         runner, session = _build_runner(Path(tmp), policy_api=LocalPolicyAdapter())
