@@ -534,6 +534,10 @@ def _foreign_tables(url: str, tmp_path: Path) -> None:
     )
 
 
+def _skill_behind_head(url: str, tmp_path: Path) -> None:
+    _legacy_module(url, "skill", target="0003_audit")
+
+
 def _two_locations(url: str, tmp_path: Path) -> None:
     _legacy_memory(url, tmp_path)
     _execute(url, 'CREATE SCHEMA "public__memory"')
@@ -576,6 +580,12 @@ LAYOUTS = {
         ["memory", "memory-store"],
         ["neither is selected"],
     ),
+    # A module store would move the tables past the recorded revision.
+    "store-on-a-history-behind-head": (
+        _skill_behind_head,
+        ["skill-store"],
+        ["records alembic 0003_audit, behind this code's alembic 0007_workflow"],
+    ),
 }
 
 
@@ -592,6 +602,12 @@ def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
     if owner == "a2a-audit-store":
         with pytest.raises(Exception) as refused:
             _a2a_audit(url, tmp_path / "a2a-again")
+        return str(refused.value)
+    if owner == "skill-store":
+        with pytest.raises(Exception) as refused:
+            _factory("openminion.modules.skill.storage", "build_skill_store", "s.db")(
+                url, tmp_path / "skill-again"
+            )
         return str(refused.value)
     entry = _migrate(url, tmp_path, capsys, owner)
     assert entry["code"] == 1 and entry[owner]["status"] == "error", entry

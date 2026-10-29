@@ -113,7 +113,9 @@ def test_dedicated_module_history_stays_in_place_and_runtime_is_refused() -> Non
         migrations=(),
     )
 
-    assert _decide("memory", base) == ps.ModuleSchema("memory", "public", "public")
+    assert _decide("memory", base) == ps.ModuleSchema(
+        "memory", "public", "public", ledger="alembic 0004_namespace"
+    )
     message = ps.runtime_refusal(base)
     assert message is not None
     assert "memory_records (part of memory alembic 0004_namespace)" in message

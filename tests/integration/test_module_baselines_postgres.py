@@ -440,13 +440,14 @@ def test_existing_table_with_other_types_is_not_adopted(
         engine.dispose()
     columns = _columns(schema, table_name)
 
-    # `storage migrate` refuses the table before any write: its columns match no
-    # listed history of the module (#446).
+    # `storage migrate` refuses the table before any write: no ledger proves it is
+    # the module's (#446).
     entry = _migrate(schema, module_id, tmp_path, capsys)
 
     assert entry["exit"] == 1
     assert (entry["status"], entry["success"]) == ("error", False)
-    assert f"{table_name} (matches no listed history)" in entry["error"]
+    assert f"no {module_id} ledger is recorded there; {table_name} (" in entry["error"]
+    assert "Nothing was written" in entry["error"]
     assert _tables(schema) == [table_name]
 
     # The revision itself, run in that schema, does not adopt the table either.

@@ -77,10 +77,15 @@ tables, each with the same columns, types, `NOT NULL` and primary key. The
 ledger is the `migrations` rows v1..vk for runtime storage; for a module, it
 is `om_meta.module_id` with its `alembic_version` row, or, for a module store
 without Alembic, with `om_meta.schema_head`. The listed histories were
-measured, not inferred: every published package from 0.0.1 to 0.1.15 was
+measured, not inferred. Every published package from 0.0.1 to 0.1.15 was
 installed from PyPI and built each owner on PostgreSQL, and so did this
-code. A table that only resembles a listed one (a subset or a superset of its
-columns, other types) is not evidence.
+code. The file lists the histories this code builds, and the layouts that a
+published package leaves (its Alembic head, a module store, or both) when an
+installed upgrade from that package to this code was verified to keep their
+rows and end in one of this code's histories (`upgraded_from`). Any other
+layout, including the few that early 0.0.x packages left and this code
+cannot upgrade, is refused as unknown. A table that only resembles a listed
+one (a subset or a superset of its columns, other types) is not evidence.
 
 - Runtime storage starts when the base schema has none of the tables it
   creates or reads, or when its `migrations` rows and every table with a
@@ -122,7 +127,11 @@ columns, other types) is not evidence.
    `openminion storage migrate`.
 2. Take a full `pg_dump` of the database, and check that it restores into a
    scratch database.
-3. Upgrade every process to the same package, then start them.
+3. Upgrade every process to the same package. Run `openminion storage
+   migrate --backend postgres` before the module stores start: a module store
+   refuses a module history whose Alembic revision is behind this package's,
+   because its own DDL would move the tables past the recorded revision.
+   Then start the processes.
 4. A refusal writes nothing. To go back, install the previous package again;
    the database is as it was.
 

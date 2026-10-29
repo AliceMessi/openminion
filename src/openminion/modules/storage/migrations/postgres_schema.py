@@ -117,6 +117,16 @@ def supported_owners() -> tuple[str, ...]:
     return tuple(sorted(_catalog().histories))
 
 
+def alembic_head(module_id: str) -> str | None:
+    """The newest Alembic ledger this code lists for ``module_id`` ("alembic <revision>")."""
+    ledgers = [
+        ledger
+        for ledger, items in _catalog().histories.get(module_id, {}).items()
+        if ledger.startswith("alembic ") and any("current" in h.measured for h in items)
+    ]
+    return max(ledgers) if ledgers else None
+
+
 @dataclass(frozen=True)
 class SchemaLayout:
     """What one schema holds, as far as ownership is concerned."""
@@ -162,6 +172,7 @@ class ModuleSchema:
     base: str
     schema: str
     create: bool = False
+    ledger: str | None = None  # the module's ledger recorded there, if any
 
     @property
     def in_place(self) -> bool:
@@ -531,7 +542,9 @@ def decide_module_schema(
                 f"that is not named <base>__<module id>. {_NOTHING_WRITTEN} {_GUIDANCE}"
             )
         if _proven_in_place(module_id, base, claims) is not None:
-            return ModuleSchema(module_id, base.name, base.name)
+            return ModuleSchema(
+                module_id, base.name, base.name, ledger=base.ledger(module_id)
+            )
         raise SchemaOwnershipError(
             f"Module {module_id!r} will not use PostgreSQL schema {_quote(base.name)}: "
             f"its objects there are not provably its own: "
@@ -558,7 +571,9 @@ def decide_module_schema(
     refusal = derived_refusal(module_id, derived, role=role)
     if refusal is not None:
         raise SchemaOwnershipError(refusal)
-    return ModuleSchema(module_id, base.name, derived.name)
+    return ModuleSchema(
+        module_id, base.name, derived.name, ledger=derived.ledger(module_id)
+    )
 
 
 def derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str | None:
@@ -677,11 +692,12 @@ def check_module_connection(engine: Engine, module_id: str) -> ModuleSchema:
         role = str(connection.execute(_sql("SELECT current_user")).scalar_one())
         layout = read_schema(connection, name)
     claims = _claims(layout)
+    ledger = layout.ledger(module_id)
     if _proven_in_place(module_id, layout, claims) is not None:
-        return ModuleSchema(module_id, name, name)
+        return ModuleSchema(module_id, name, name, ledger=ledger)
     refusal = derived_refusal(module_id, layout, role=role)
     if refusal is None:
-        return ModuleSchema(module_id, name, name)
+        return ModuleSchema(module_id, name, name, ledger=ledger)
     raise SchemaOwnershipError(refusal)
 
 
@@ -777,6 +793,15 @@ def module_storage_config(
     if not url:
         return config
     selection = select_postgres_module_schema(url, module_id, create=True)
+    head = alembic_head(module_id)
+    if (selection.ledger or "").startswith("alembic ") and selection.ledger != head:
+        # The store's own DDL would move the tables past the recorded revision.
+        raise SchemaOwnershipError(
+            f"Module {module_id!r}: PostgreSQL schema {_quote(selection.schema)} records "
+            f"{selection.ledger}, behind this code's {head}. Run `openminion storage "
+            f"migrate --backend postgres --module {module_id}` before the module "
+            f"store opens it. {_NOTHING_WRITTEN}"
+        )
     if selection.in_place:
         return config
     options["url"] = selection.url(url)
@@ -812,6 +837,7 @@ def _read_only(engine: Engine) -> Iterator[Connection]:
 __all__ = [
     "History",
     "ModuleSchema",
+    "alembic_head",
     "SchemaLayout",
     "check_module_connection",
     "check_runtime_postgres_url",
