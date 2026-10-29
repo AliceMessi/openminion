@@ -35,6 +35,19 @@ This file tracks package-facing release notes for `openminion`.
   started. A successful start hands the same objects to the runtime as
   before (Refs #447).
 
+- Skip a turn's decision record and tool outcome candidate when the agent's
+  `memory.write` is not allowed. The brain wrote a `decision` record for every
+  routed turn and staged a `tool_outcome` candidate for a refused tool call,
+  with the call's arguments, without asking the memory policy, so with an
+  identity hard constraint such as `NEVER write memory records` a refused
+  `memory.write` call still left its content in the memory candidates. Both
+  writes now use the turn's `memory.write` answer, which the brain bridge asks
+  on every turn, including scheduled consolidation and diagnostic turns. When
+  it is not `allow`, including when it needs approval, the decision record is
+  skipped (`brain.decision_memory.skipped`, `memory_write_not_authorized`) and
+  no candidate is staged. The working state keeps the decision metadata, and
+  nothing asks for approval for these writes (Refs #496).
+
 ## Current package line - 2026-10-28
 
 - Start `APIRuntime` with PostgreSQL runtime storage (`storage.backend:

@@ -64,8 +64,20 @@ and asks no approval for its capture. Its reply is unchanged, and its capture
 intent stays pending with `"error_code": "CAPTURE_RECOVERY_UNAUTHORIZED"` in
 `memory_capture_bundle_result`. Pending-capture recovery asks its own check
 before it extracts, so it commits the intent once the write is allowed. A turn
-whose capture is excluded or disabled asks nothing and makes no extraction
-request.
+whose capture is excluded or disabled makes no extraction request.
+
+The bridge asks on every turn, including excluded (scheduled consolidation)
+and disabled (diagnostic) turns, and keeps the answer on the runner. Two
+optional writes the brain makes for itself during the turn need it too: the
+`decision` record of the turn's routing decision (`write_decision_memory`) and
+the `tool_outcome` candidate staged for a tool call's outcome
+(`_stage_tool_outcome_candidate`). When the answer is not `allow`, the decision
+record is skipped with `brain.decision_memory.skipped`
+(`memory_write_not_authorized`), no candidate is staged, and nothing is kept
+pending. The working state keeps the decision metadata. The turn's own capture
+is authorized only when the answer is `allow` and its capture is neither
+excluded nor disabled. A `BrainRunner` used without the service keeps both
+writes.
 
 ## Backend options
 
