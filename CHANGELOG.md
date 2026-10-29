@@ -69,6 +69,14 @@ This file tracks package-facing release notes for `openminion`.
   selection during a leave waits for it and is refused with the existing
   `Agent ... is not an active participant` error. The errors and the
   returned session are unchanged (Refs #495).
+- Stage no `tool_outcome` memory candidate for a tool call that did not run.
+  When the user denied a tool call, or the call was still waiting for the
+  user's confirmation, the brain staged a `policy_denied` `tool_outcome`
+  candidate in agent scope whose content and metadata held the call's
+  arguments, also when the agent's memory policy allowed the write. Such a
+  call now stages no candidate. Candidates for calls that ran (failure,
+  timeout, allowlisted success), the turn's `memory.write` answer and the
+  policy and approval events are unchanged (Refs #524).
 
 ## Current package line - 2026-10-28
 
