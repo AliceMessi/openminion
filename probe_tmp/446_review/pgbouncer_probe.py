@@ -116,6 +116,21 @@ def case(label: str, extra: str, server: str) -> None:
             print("storage migrate output:", buf.getvalue()[:300])
         after = snapshot(direct_url)
         print("schemas after:", sorted({s for s, _ in after}))
+        print("memory_records in:", sorted(s for s, t in after if t == "memory_records"))
+        # One pooled server connection, two clients: does one client's search_path leak?
+        a_url = pooled.update_query_dict({"options": '-c search_path="public__memory"'}).render_as_string(hide_password=False)
+        try:
+            ea, eb = sa.create_engine(a_url), sa.create_engine(pooled_url)
+            with ea.connect() as ca, eb.connect() as cb:
+                for _ in range(3):
+                    sa_path = ca.execute(sa.text("SHOW search_path")).scalar()
+                    ca.commit()
+                    sb_path = cb.execute(sa.text("SHOW search_path")).scalar()
+                    cb.commit()
+                print("two clients, search_path:", sa_path, "|", sb_path)
+            ea.dispose(); eb.dispose()
+        except Exception as exc:  # noqa: BLE001
+            print("two clients: error:", str(exc).splitlines()[0][:200])
     finally:
         print("pgbouncer log:", stop(proc))
         with admin.connect() as conn:
@@ -128,6 +143,7 @@ def main() -> None:
     print(subprocess.run(["pgbouncer", "--version"], capture_output=True, text=True).stdout.strip())
     case("defaults", "", server)
     case("ignore_startup_parameters = options", "ignore_startup_parameters = options", server)
+    case("track_extra_parameters = search_path", "track_extra_parameters = search_path", server)
 
 
 if __name__ == "__main__":
