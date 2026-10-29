@@ -597,8 +597,8 @@ def test_daemon_runs_a_task_consolidate_memory_job_with_its_persisted_task_kind(
     assert second.extractor_calls == []
     assert second.intent_result == first.intent_result
     # An ordinary turn with the job's id and the consolidation keys is captured.
-    assert forged["capture_state"] == "succeeded"
-    assert str(forged["capture_id"]) in results
+    assert forged["capture_state"] == "pending"
+    assert results[str(forged["capture_id"])]["disposition"] == "succeeded"
 
 
 def test_daemon_run_of_a_task_consolidate_memory_job_keeps_unsupported_work_pending(
@@ -644,9 +644,7 @@ def test_daemon_pauses_a_pre_upgrade_consolidation_job_and_keeps_its_pending_wor
         intent = _turn(runtime, monkeypatch, fail_capture_write=True)
         assert intent["capture_state"] == "pending"
         owner = _task_owner(runtime)
-        legacy_id = _create_pre_upgrade_consolidation_task(
-            owner, tmp_path, monkeypatch
-        )
+        legacy_id = _create_pre_upgrade_consolidation_task(owner, tmp_path, monkeypatch)
         with _daemon(runtime, owner, monkeypatch) as lookups:
             legacy = _daemon_run(runtime, monkeypatch, owner, legacy_id, intent)
             legacy_task = owner.get_task(legacy_id)
