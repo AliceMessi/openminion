@@ -567,7 +567,8 @@ def run_case(case: str, title: str, url: str, steps: list, *, as_url: str | None
         result = attempt(fn)
         changes = snapshot_diff(before, snapshot(url))
         body["steps"].append({"step": name, "result": result, "changes": changes})
-        say("STEP", case, f"{name}: {result}")
+        failed = result.startswith("FAILED") or "success=False" in result
+        say("STEP", case, f"{name}: {result}" + (f" | left behind: {changes}" if failed else ""))
     if dev_only_first:
         body["preflight_dev_manifest_only"] = run_preflight(url, as_url or url, case, "_dev_manifest_only", DEV_MANIFEST)
     body["preflight"] = run_preflight(url, as_url or url, case, "")
@@ -643,6 +644,16 @@ def cases() -> None:
     run_case("b_mem_rt", "memory store, then runtime storage (fails at v4): migrations is in both histories", u,
              [("memory store + record", lambda: memory_store(u, "b-mr", put="rec-1")),
               ("runtime storage", lambda: build_runtime(u, "b-mr"))])
+    u = new_db("b_rt_a2a")
+    run_case("b_rt_a2a", "runtime storage with rows, then the A2A audit store with a record (round-2 row 5: A2A adopts "
+             "runtime storage's idempotency_keys)", u,
+             [("runtime storage", lambda: build_runtime(u, "b-ra")), ("runtime rows", lambda: runtime_rows(u)),
+              ("a2a audit store + record", lambda: a2a_audit(u, "b-ra", append="msg-1"))])
+    u = new_db("b_rt_sstore")
+    run_case("b_rt_sstore", "runtime storage with rows, then the session module store (fails; leaves an index on "
+             "runtime storage's sessions)", u,
+             [("runtime storage", lambda: build_runtime(u, "b-rs")), ("runtime rows", lambda: runtime_rows(u)),
+              ("session module store", lambda: session_store(u, "b-rs"))])
     u = new_db("b_lone")
     run_case("b_lone", "A2A audit store, then runtime storage (fails at v1): an empty migrations table is left", u,
              [("a2a audit store + record", lambda: a2a_audit(u, "b-l", append="msg-1")),
