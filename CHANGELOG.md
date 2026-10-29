@@ -82,6 +82,24 @@ This file tracks package-facing release notes for `openminion`.
   database the baseline created, where it failed with a duplicate
   `next_attempt_at` column, on SQLite too. The SQLite DDL and the revisions
   are unchanged (Refs #494).
+- Give each PostgreSQL module its own schema, and refuse a layout whose
+  ownership is not proven before anything is written. Runtime storage and
+  every module wrote into the one schema the configured URL selects, so they
+  shared `alembic_version` and `om_meta`, and `CREATE TABLE IF NOT EXISTS`
+  let one owner adopt another's `sessions`, `events`, `idempotency_keys`,
+  `memory_records`, `migrations` or `agents`. Runtime storage keeps that
+  schema; each module now uses `<base>__<module id>`, created inside its
+  migration transaction (or, for a store without Alembic, before its first
+  table) with the URL's other options kept. A module whose history is already
+  in the base schema, such as a dedicated PostgreSQL memory database, stays
+  there with no move or stamp. A history counts only when its ledger and its
+  tables exactly match one listed in `postgres_histories.json`, which was
+  measured from every published release and this code. Runtime storage and
+  the modules refuse, with a message that names the tables, a shared or
+  unknown layout, for example the A2A audit store on the runtime URL or memory
+  first and then runtime storage; owners that do not use those tables are not
+  affected. `docs/runtime-database-upgrades.md` gives the operator's
+  relocation steps (Refs #446).
 
 ## Current package line - 2026-10-28
 
