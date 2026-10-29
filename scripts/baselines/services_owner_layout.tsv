@@ -80,7 +80,12 @@ scope	max_python_files	max_loc
 # and agent id the capture recovery call site passes (+22 LOC in
 # services/brain/post_execution/mixin.py; measured on the tree reconciled with
 # dev 37fa75ff: 209 files, 42314 LOC).
-services	209	42314
+# Issue 496 (2026-10-29) keeps that memory.write answer on the runner for the
+# turn's decision records and tool outcome candidates, asked on every turn,
+# and derives the capture authorization from it (+2 LOC in
+# services/brain/post_execution/mixin.py; measured on the #448 head 6064d6d7
+# with this change: 209 files, 42316 LOC).
+services	209	42316
 services/security	6	187
 services/stats	1	25
 services/tool	3	50

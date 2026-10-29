@@ -179,8 +179,13 @@ class BrainBridgeTurnMixin:
         runner._terminal_capture_enabled_for_turn = terminal_capture_is_enabled(
             message.metadata or {}
         )
-        runner._capture_authorized_for_turn = self._memory_capture_authorized(
+        runner._memory_write_allowed_for_turn = self._turn_memory_write_allowed(
             message=message, session_id=session_id
+        )
+        runner._capture_authorized_for_turn = (
+            runner._memory_write_allowed_for_turn
+            and runner._terminal_capture_enabled_for_turn
+            and not runner._capture_excluded_for_turn
         )
         self._inject_gateway_system_context(
             runner=runner,
@@ -205,11 +210,8 @@ class BrainBridgeTurnMixin:
 
         return runner, session_id, request_id, turn_id, turn_start_time
 
-    def _memory_capture_authorized(self, *, message: Message, session_id: str) -> bool:
-        metadata = message.metadata or {}
-        if capture_is_excluded(metadata) or not terminal_capture_is_enabled(metadata):
-            return False
-        capture = capture_run_kwargs(metadata)
+    def _turn_memory_write_allowed(self, *, message: Message, session_id: str) -> bool:
+        capture = capture_run_kwargs(message.metadata or {})
         service_port = AgentServiceTurnFlowAdapter(self)
         return bool(
             memory_capture_allowed(

@@ -134,6 +134,7 @@ class BrainRunner:
         self.terminal_capture_writer = terminal_capture_writer
         self._terminal_capture_enabled_for_turn = True
         self._capture_authorized_for_turn = True
+        self._memory_write_allowed_for_turn = True
         self._lgmh_hydrated_sessions: set[str] = set()
         self._pending_run_trigger: str | None = None
         self._pending_gateway_system_context: str | None = None
