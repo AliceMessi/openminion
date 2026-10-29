@@ -3,6 +3,7 @@ from openminion.modules.storage.migrations.alembic import (
     drop_sql_objects,
 )
 from openminion.modules.controlplane.pairing.schema import CP_PAIRING_SCHEMA
+from openminion.modules.controlplane.storage.store import _postgresify_ddl
 
 
 revision = "0001_baseline"
@@ -221,8 +222,14 @@ DDL = (
 )
 
 
+POSTGRES_DDL = tuple(_postgresify_ddl(statement) for statement in DDL)
+
+
 def upgrade() -> None:
-    apply_ddl_statements(DDL)
+    from alembic import op
+
+    bind = op.get_bind()
+    apply_ddl_statements(POSTGRES_DDL if bind.dialect.name == "postgresql" else DDL)
 
 
 def downgrade() -> None:

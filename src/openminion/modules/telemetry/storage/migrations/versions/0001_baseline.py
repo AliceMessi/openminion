@@ -30,9 +30,33 @@ DDL = (
     "CREATE INDEX IF NOT EXISTS idx_turn ON events(session_id, turn_id)",
 )
 
+POSTGRES_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        id SERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        timestamp DOUBLE PRECISION NOT NULL,
+        data TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS om_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_session ON events(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_turn ON events(session_id, turn_id)",
+)
+
 
 def upgrade() -> None:
-    apply_ddl_statements(DDL)
+    from alembic import op
+
+    bind = op.get_bind()
+    apply_ddl_statements(POSTGRES_DDL if bind.dialect.name == "postgresql" else DDL)
 
 
 def downgrade() -> None:
