@@ -38,7 +38,7 @@ def qi(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-@dataclass(frozen=True)
+@dataclass
 class State:
     owner: str
     label: str  # "v3", "0004_namespace", "store"
@@ -46,6 +46,11 @@ class State:
     order: int
     required: dict  # table -> signature
     optional: dict = field(default_factory=dict)  # store-only tables, accepted when present
+    source: str = "dev"  # the code that produced this shape: the checkout, or a published release
+
+    @property
+    def name(self) -> str:
+        return f"{self.owner}@{self.label}" + ("" if self.source == "dev" else f" ({self.source} shape)")
 
 
 @dataclass
@@ -187,7 +192,9 @@ def related(t: str, sig: tuple, manifest: Manifest) -> dict:
     names = colnames(sig)
     for owner, states in manifest.states.items():
         for st in states:
-            exp = st.required.get(t) or st.optional.get(t)
+            exp, label = st.required.get(t), st.label
+            if exp is None:
+                exp, label = st.optional.get(t), "store bootstrap"
             if exp is None:
                 continue
             en = colnames(exp)
@@ -201,7 +208,9 @@ def related(t: str, sig: tuple, manifest: Manifest) -> dict:
                 kind = "column superset"
             else:
                 continue
-            rel.setdefault(owner, {}).setdefault(kind, []).append(st.label)
+            labels = rel.setdefault(owner, {}).setdefault(kind, [])
+            if label not in labels:
+                labels.append(label)
     return rel
 
 
@@ -212,7 +221,7 @@ def fmt_related(rel: dict) -> str:
 @dataclass
 class Classification:
     layout: Layout
-    complete: dict  # owner -> State
+    complete: dict  # owner -> State (several shapes of one revision may match; they share the label)
     incomplete_ledgers: dict  # owner -> (State, [mismatch])
     tables: dict  # table -> dict(cls, owner, related, detail)
 
@@ -222,20 +231,25 @@ class Classification:
 
 
 def classify(manifest: Manifest, lay: Layout) -> Classification:
-    complete, incomplete = {}, {}
+    matched: dict = {}
+    incomplete = {}
     for owner, states in manifest.states.items():
         for st in states:
             if not ledger_matches(st, lay, manifest):
                 continue
             miss = mismatches(st, lay)
             if miss:
-                incomplete[owner] = (st, miss)
+                incomplete.setdefault(owner, (st, miss))
             else:
-                complete[owner] = st
+                matched.setdefault(owner, []).append(st)
+    complete = {owner: sts[0] for owner, sts in matched.items()}
+    incomplete = {o: v for o, v in incomplete.items() if o not in matched}
     explained: dict = {}
-    for owner, st in complete.items():
-        for t in (*st.required, *(x for x in st.optional if x in lay.tables)):
-            explained.setdefault(t, []).append(f"{owner}@{st.label}")
+    for owner, sts in matched.items():
+        # Several shapes of one owner's recorded revision can match (the same revision as written by
+        # different releases); they are one owner, so their tables are unioned, never compared.
+        for t in sorted({x for st in sts for x in (*st.required, *(y for y in st.optional if y in lay.tables))}):
+            explained.setdefault(t, []).append(" | ".join(st.name for st in sts))
     tables = {}
     for t, sig in sorted(lay.tables.items()):
         if t in INFRA or t not in manifest.names():
@@ -267,8 +281,8 @@ def classify(manifest: Manifest, lay: Layout) -> Classification:
 
 def ledger_line(c: Classification) -> str:
     lay = c.layout
-    done = ", ".join(f"{o}@{st.label}" for o, st in sorted(c.complete.items())) or "none"
-    bad = "; ".join(f"{o}@{st.label}: {', '.join(m)}" for o, (st, m) in sorted(c.incomplete_ledgers.items())) or "none"
+    done = ", ".join(st.name for _, st in sorted(c.complete.items())) or "none"
+    bad = "; ".join(f"{st.name}: {', '.join(m)}" for _, (st, m) in sorted(c.incomplete_ledgers.items())) or "none"
     return (f"alembic_version={lay.alembic} om_meta={lay.om_meta} migrations="
             f"{None if lay.migrations is None else [v for v, _ in lay.migrations]} | complete histories: {done} | "
             f"ledger without matching tables: {bad}")
@@ -363,7 +377,8 @@ def decide_module(manifest: Manifest, m: str, cb: Classification, cd: Classifica
     bad = sorted(t for t in cb.tables if (t in manifest.names(m) or m in cb.tables[t]["related"])
                  and not cb.owned_by(t, m))
     if st is not None and not bad:
-        later = [s.label for s in manifest.states[m] if s.kind == st.kind and s.order > st.order]
+        later = sorted({(s.order, s.label) for s in manifest.states[m] if s.kind == st.kind and s.order > st.order})
+        later = [label for _, label in later]
         if not cb.layout.usage or (later and not cb.layout.create):
             return ("REFUSE", f"{m}: role {role} lacks USAGE or CREATE on {qi(base)} for its history there. {NOTE}")
         return ("IN_PLACE", f"{m}'s complete history {st.label} in {qi(base)} stays where it is (no move, no stamp)"

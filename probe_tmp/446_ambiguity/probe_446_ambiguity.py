@@ -37,13 +37,18 @@ from ownership_proof import (  # noqa: E402
 )
 
 BASE = os.environ["OPENMINION_TEST_POSTGRES_URL"]
-OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("probe_446_ambiguity.json")
+# Usage: probe_446_ambiguity.py OUT.json                  (checkout: manifest, cases, preflight)
+#        probe_446_ambiguity.py --release TAG OUT.json    (a published release: its manifest and the
+#                                                          histories it builds, for the checkout run)
+RELEASE = sys.argv[2] if len(sys.argv) > 3 and sys.argv[1] == "--release" else None
+OUT = Path(sys.argv[-1]) if len(sys.argv) > 1 else Path("probe_446_ambiguity.json")
 ROOT = Path(tempfile.mkdtemp(prefix="p446amb-"))
 os.environ["OPENMINION_HOME"] = str(ROOT / "home")
 os.environ.pop("PGOPTIONS", None)
 SHOWN = ["memory", "a2a", "session", "registry", "artifact"]
-RESULTS: dict = {"manifest": {}, "cases": {}, "notes": []}
-MANIFEST: Manifest | None = None
+RESULTS: dict = {"manifest": {}, "cases": {}, "releases": {}}
+MANIFEST: Manifest | None = None  # the checkout's shapes plus the release shapes that differ
+DEV_MANIFEST: Manifest | None = None  # the checkout's shapes only
 ROLE = f"om_app_{uuid.uuid4().hex[:6]}"
 ROLE_PASSWORD = "probe446"
 
@@ -361,11 +366,11 @@ def fmt_sig(sig: tuple) -> str:
     return f"({cols}) pk({', '.join(sig[1])})"
 
 
-def build_manifest() -> Manifest:
+def build_manifest(db_tag: str = "manifest") -> Manifest:
     from openminion.modules.storage.backends.postgres import RecordStorePostgres
     from openminion.modules.storage.runtime.migrations import DEFAULT_MIGRATIONS, migrate_record_store
 
-    url = new_db("manifest")
+    url = new_db(db_tag)
     states: dict = {"runtime": []}
     versions = {m.version: m.name for m in DEFAULT_MIGRATIONS}
     admin_exec(url, 'CREATE SCHEMA "mf_runtime"')
@@ -426,48 +431,107 @@ def build_manifest() -> Manifest:
             states[m].append(State(m, "store", "store", 1000, tables))
     manifest = Manifest(states=states, runtime_versions=versions)
 
+    report_manifest(manifest, "manifest", "")
+    return manifest
+
+
+def report_manifest(manifest: Manifest, key: str, suffix: str) -> None:
+    states = manifest.states
     by_name: dict = {}
     for owner, sts in states.items():
         for st in sts:
-            for t, sig in (*st.required.items(), *st.optional.items()):
-                by_name.setdefault(t, {}).setdefault(owner, {}).setdefault(sig, []).append(st.label)
+            label = "store bootstrap" if st.kind == "store" else st.label
+            label = label if st.source == "dev" else f"{label} ({st.source} shape)"
+            for t, sig in st.required.items():
+                labels = by_name.setdefault(t, {}).setdefault(owner, {}).setdefault(sig, [])
+                if label not in labels:
+                    labels.append(label)
+            for t, sig in st.optional.items():
+                labels = by_name.setdefault(t, {}).setdefault(owner, {}).setdefault(sig, [])
+                if "store bootstrap" not in labels:
+                    labels.append("store bootstrap")
     shared = {t: o for t, o in by_name.items() if len(o) > 1}
-    RESULTS["manifest"]["owners"] = {o: [s.label for s in sts] for o, sts in states.items()}
-    RESULTS["manifest"]["tables"] = {
-        o: {st.label: {"required": {t: [list(map(list, s[0])), list(s[1])] for t, s in st.required.items()},
-                       "optional": {t: [list(map(list, s[0])), list(s[1])] for t, s in st.optional.items()}}
-            for st in sts} for o, sts in states.items()}
-    RESULTS["manifest"]["shared_names"] = {}
+    RESULTS.setdefault(key, {})["owners"] = {o: [s.name for s in sts] for o, sts in states.items()}
+    RESULTS[key]["tables"] = dump_states(manifest)["states"]
+    RESULTS[key]["shared_names"] = {}
     for t in sorted(shared):
         entry = []
         for owner in sorted(shared[t]):
             for sig, labels in shared[t][owner].items():
                 entry.append({"owner": owner, "revisions": labels, "signature": fmt_sig(sig)})
-                say("SHARED", t, f"{owner} {span_labels(labels)}: {fmt_sig(sig)}")
+                say("SHARED" + suffix, t, f"{owner} {span_labels(labels)}: {fmt_sig(sig)}")
         owners = sorted(shared[t])
         same = []
         for i, a in enumerate(owners):
             for b in owners[i + 1:]:
                 for sig in set(shared[t][a]) & set(shared[t][b]):
                     same.append(f"{a} {span_labels(shared[t][a][sig])} == {b} {span_labels(shared[t][b][sig])}")
-        say("IDENTICAL", t, "; ".join(same) if same else "no two owners share a signature")
-        RESULTS["manifest"]["shared_names"][t] = {"signatures": entry, "identical_across_owners": same}
-    return manifest
+        say("IDENTICAL" + suffix, t, "; ".join(same) if same else "no two owners share a signature")
+        RESULTS[key]["shared_names"][t] = {"signatures": entry, "identical_across_owners": same}
 
 
 def span_labels(labels: list) -> str:
     return labels[0] if len(labels) == 1 else f"{labels[0]}..{labels[-1]}"
 
 
+def dump_states(manifest: Manifest) -> dict:
+    def sigs(d: dict) -> dict:
+        return {t: [[list(c) for c in s[0]], list(s[1])] for t, s in d.items()}
+
+    return {"runtime_versions": {str(k): v for k, v in manifest.runtime_versions.items()},
+            "states": {o: [{"label": st.label, "kind": st.kind, "order": st.order, "source": st.source,
+                            "required": sigs(st.required), "optional": sigs(st.optional)} for st in sts]
+                       for o, sts in manifest.states.items()}}
+
+
+def load_states(data: dict, source: str) -> Manifest:
+    def sigs(d: dict) -> dict:
+        return {t: (tuple(tuple(c) for c in s[0]), tuple(s[1])) for t, s in d.items()}
+
+    return Manifest(
+        states={o: [State(o, s["label"], s["kind"], s["order"], sigs(s["required"]), sigs(s["optional"]), source)
+                    for s in sts] for o, sts in data["states"].items()},
+        runtime_versions={int(k): v for k, v in data["runtime_versions"].items()})
+
+
+def merge_release(dev: Manifest, rel: Manifest, tag: str) -> Manifest:
+    """Add every release shape that differs from the checkout's shape of the same revision."""
+    states = {o: list(sts) for o, sts in dev.states.items()}
+    for v, name in rel.runtime_versions.items():
+        if dev.runtime_versions.get(v) != name:
+            say("RELEASE", tag, f"runtime v{v} is named {name!r} there and {dev.runtime_versions.get(v)!r} here")
+    for owner, sts in rel.states.items():
+        same, added = [], []
+        for st in sts:
+            mine = [d for d in dev.states.get(owner, []) if d.label == st.label and d.kind == st.kind]
+            if any(d.required == st.required and d.optional == st.optional for d in mine):
+                same.append(st.label)
+                continue
+            states.setdefault(owner, []).append(st)
+            if not mine:
+                added.append(f"{st.label}: not in the checkout")
+                continue
+            d = mine[0]
+            only_rel = sorted(set(st.required) - set(d.required))
+            only_dev = sorted(set(d.required) - set(st.required))
+            other = sorted(t for t in set(st.required) & set(d.required) if st.required[t] != d.required[t])
+            added.append(f"{st.label}: tables only in {tag} {only_rel}, only in the checkout {only_dev}, "
+                         f"other signature {other}")
+        say("RELEASE", tag, f"{owner}: same shape as the checkout for {span_labels(same) if same else 'no revision'}"
+            + (f"; added as extra shapes: {'; '.join(added)}" if added else ""))
+        RESULTS["releases"].setdefault(tag, {})[owner] = {"same": same, "added": added}
+    return Manifest(states=states, runtime_versions=dev.runtime_versions)
+
+
 # ---------------------------------------------------------------- cases
 
-def run_preflight(admin_url: str, run_url: str, case: str, label: str) -> dict:
+def run_preflight(admin_url: str, run_url: str, case: str, label: str, manifest: Manifest | None = None) -> dict:
     before = snapshot(admin_url)
     eng = sa.create_engine(run_url)
     with eng.connect() as conn:
         conn.execute(text("SET TRANSACTION READ ONLY"))
         read_only = conn.execute(text("SHOW transaction_read_only")).scalar()
-        out = preflight(conn, MANIFEST, SHOWN)
+        out = preflight(conn, manifest or MANIFEST, SHOWN)
         conn.rollback()
     eng.dispose()
     after = snapshot(admin_url)
@@ -493,15 +557,19 @@ def run_preflight(admin_url: str, run_url: str, case: str, label: str) -> dict:
 
 
 def run_case(case: str, title: str, url: str, steps: list, *, as_url: str | None = None, today: bool = True,
-             after: list | None = None) -> None:
+             after: list | None = None, dev_only_first: bool = False, recorded: list | None = None) -> None:
     say("CASE", case, title)
-    body: dict = {"title": title, "steps": []}
+    body: dict = {"title": title, "steps": list(recorded or [])}
+    for item in recorded or []:
+        say("STEP", case, f"{item['step']}: {item['result']}")
     for name, fn in steps:
         before = snapshot(url)
         result = attempt(fn)
         changes = snapshot_diff(before, snapshot(url))
         body["steps"].append({"step": name, "result": result, "changes": changes})
         say("STEP", case, f"{name}: {result}")
+    if dev_only_first:
+        body["preflight_dev_manifest_only"] = run_preflight(url, as_url or url, case, "_dev_manifest_only", DEV_MANIFEST)
     body["preflight"] = run_preflight(url, as_url or url, case, "")
     if today:
         body["today"] = {}
@@ -642,9 +710,44 @@ def cases() -> None:
                  u, 'CREATE SCHEMA "public__memory"', 'CREATE TABLE "public__memory".notes (id INTEGER PRIMARY KEY)'))],
              today=False)
 
+    # (r) histories written by a published release, classified with and without that release's shapes
+    for tag, built in RELEASE_CASES:
+        for case, info in built.items():
+            run_case(case, info["title"], url_for(info["db"]), [], today=False, dev_only_first=True,
+                     recorded=[dict(item, step=f"[{tag} run] {item['step']}") for item in info["steps"]])
+
+
+RELEASE_CASES: list = []
+
+
+def release_mode(tag: str) -> None:
+    t = tag.replace(".", "")
+    manifest = build_manifest(f"manifest_{t}")
+    RESULTS["release_manifest"] = dump_states(manifest)
+    RESULTS["release_cases"] = {}
+
+    def record(case: str, title: str, url: str, steps: list) -> None:
+        done = []
+        for name, fn in steps:
+            result = attempt(fn)
+            done.append({"step": name, "result": result})
+            say("STEP", case, f"{name}: {result}")
+        RESULTS["release_cases"][case] = {"db": sa.engine.make_url(url).database, "title": title, "steps": done}
+
+    u = new_db(f"r_session_{t}")
+    record(f"r_session_{t}", f"session history written by the published {tag} (storage migrate --module session), "
+           "one session row", u,
+           [(f"migrate session with {tag}", lambda: alembic_module(u, "session", f"r-s-{t}")),
+            ("one session row", lambda: admin_exec(u, "INSERT INTO sessions(session_id, created_at, updated_at, status) "
+                                                      "VALUES ('s-1', '2026-10-29', '2026-10-29', 'active')"))])
+    u2 = new_db(f"r_runtime_{t}")
+    record(f"r_runtime_{t}", f"runtime storage history written by the published {tag}, one session and one "
+           "idempotency row", u2,
+           [(f"runtime storage with {tag}", lambda: build_runtime(u2, f"r-r-{t}")), ("runtime rows", lambda: runtime_rows(u2))])
+
 
 def main() -> int:
-    global MANIFEST
+    global MANIFEST, DEV_MANIFEST
     import importlib.metadata as md
 
     RESULTS["versions"] = {p: md.version(p) for p in ("openminion", "sqlalchemy", "psycopg", "alembic")}
@@ -655,7 +758,24 @@ def main() -> int:
     eng.dispose()
     say("VERSIONS", "postgres", RESULTS["server"])
     try:
-        MANIFEST = build_manifest()
+        if RELEASE:
+            release_mode(RELEASE)
+            OUT.write_text(json.dumps(RESULTS, indent=1, sort_keys=True, default=str), encoding="utf-8")
+            return 0
+        MANIFEST = DEV_MANIFEST = build_manifest()
+        for item in filter(None, os.environ.get("EXTRA_MANIFESTS", "").split(",")):
+            tag, path = item.split("=", 1)
+            if not Path(path).is_file():
+                say("RELEASE", tag, f"no release output at {path}; release shapes not merged")
+                continue
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if "release_manifest" not in data:
+                say("RELEASE", tag, f"release run has no manifest: {data.get('error', '')[-300:]}")
+                continue
+            MANIFEST = merge_release(MANIFEST, load_states(data["release_manifest"], tag), tag)
+            RELEASE_CASES.append((tag, data.get("release_cases", {})))
+        if MANIFEST is not DEV_MANIFEST:
+            report_manifest(MANIFEST, "manifest_with_releases", "_WITH_RELEASES")
         cases()
     except Exception as exc:  # noqa: BLE001
         say("ERROR", "main", short_exc(exc))
