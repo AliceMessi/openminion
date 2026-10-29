@@ -32,6 +32,248 @@ the derived data and leaves it wrong.
 If a migration fails, it raises, and the database stays at the previous
 version. Fix the cause it reports and start again.
 
+## PostgreSQL schemas per owner
+
+On PostgreSQL, runtime storage and the modules used to write into the one
+schema the configured URL selects. They shared `alembic_version` and
+`om_meta`, and their `CREATE TABLE IF NOT EXISTS` adopted each other's
+tables: `sessions`, `events`, `idempotency_keys`, `memory_records`,
+`migrations`, `agents`, `session_turn_leases` and `session_retention_holds`
+each have more than one owner. Since #446:
+
+- Runtime storage keeps that schema, the *base schema*: `current_schema()`
+  of the configured URL, which follows its `options`, `PGOPTIONS` and the
+  role's or database's `search_path`.
+- Each module uses its own schema, `<base>__<module id>`, for example
+  `public__memory`. The module's connection keeps every option of the
+  configured URL and appends `-c search_path="<base>__<module id>"` (a URL
+  without `options` starts from `PGOPTIONS`). `openminion storage migrate
+  --backend postgres`, the memory store and the A2A audit store create the
+  schema inside the migration transaction, so a failed migration leaves no
+  schema. The other module stores create it before their first table.
+- A module whose supported history is already in the base schema keeps using
+  it there. Nothing is moved or stamped. This is the case of a dedicated
+  database, for example a PostgreSQL memory database or a database where
+  `storage migrate --module <id>` ran alone.
+
+This covers every PostgreSQL module writer: `openminion storage migrate`
+(also with `--plan`), the startup check, the memory store, the A2A audit
+and state stores, the storage module's `a2a-archive-old` command, the
+session store, the controlplane store and the other module store factories.
+SQLite is unchanged.
+
+### What is checked before any write
+
+One `READ ONLY` transaction reads only the base schema and
+`<base>__<module id>`: their table names; for tables with an OpenMinion
+name, the columns, types, `NOT NULL` and primary key; the ledger rows
+(`migrations`, `alembic_version`, `om_meta`); the schema owner and
+privileges.
+
+An owner's history in a schema is proven only by its ledger together with
+an exact match of one of its histories listed in
+`src/openminion/modules/storage/migrations/postgres_histories.json`: the same
+tables, each with the same columns, types, `NOT NULL` and primary key. The
+ledger is the `migrations` rows v1..vk for runtime storage; for a module, it
+is `om_meta.module_id` with its `alembic_version` row, or, for a module store
+without Alembic, with `om_meta.schema_head`. The listed histories were
+measured, not inferred: every published package from 0.0.1 to 0.1.15 was
+installed from PyPI and built each owner on PostgreSQL, and so did this
+code. A table that only resembles a listed one (a subset or a superset of its
+columns, other types) is not evidence.
+
+- Runtime storage starts when the base schema has none of the tables it
+  creates or reads, or when its `migrations` rows and every table with a
+  runtime storage name match one listed history exactly, and no other owner's
+  recorded history includes one of those tables.
+- A module stays in the base schema when its ledger and every table with one
+  of its names match one listed history exactly, and no other owner's
+  recorded history includes one of those tables.
+- A module uses `<base>__<module id>` when the base schema holds nothing of
+  it: no `om_meta` names it, and each table with one of its names belongs to
+  exactly one other owner's recorded history. An existing
+  `<base>__<module id>` is used only when it is empty, or holds the module's
+  proven history, or (a store that stopped before writing its ledger) holds
+  only tables whose names and columns are listed for the module; the role
+  needs `USAGE` and `CREATE` on it.
+- Everything else is refused before any write. The message names the tables,
+  the ledger recorded there and the listed histories those tables match.
+  Owners that do not use the refused table names are not affected.
+
+| Layout of the base schema | Runtime storage | Modules |
+| --- | --- | --- |
+| Empty, or only other applications' tables with other names | starts | create `<base>__<id>` |
+| Runtime storage history only | starts | create `<base>__<id>` |
+| One module's history only (dedicated database) | refused when it uses one of that module's table names | that module stays in place; the others create `<base>__<id>` |
+| A module's history, then runtime storage, which committed v1..v3 and failed at v4 (memory first) | refused | memory refused (`migrations` is in both recorded histories) |
+| A module's history and the empty `migrations` table of a runtime start that failed before v1 | refused | memory refused; the module stays in place |
+| Runtime storage, then a module store on the same URL that adopted one of its tables (the A2A audit store and `idempotency_keys`) | starts | that module refused; a module that uses one of that module's table names (registry: `agents`) refused |
+| Several modules behind one `alembic_version` (`storage migrate` for several modules on one schema) | starts unless one of its tables changed | modules whose history is not proven refused |
+| A table with an OpenMinion name that matches no listed history, or that misses or adds a column | refused when it is one of its tables | modules that use the name refused |
+| The module's history in the base schema, and `<base>__<id>` exists | as above | refused: two locations |
+| `search_path` names no existing schema | refused | refused |
+| A base schema name with other characters than letters, digits and `_`, or a `<base>__<id>` longer than 63 bytes | as above | a module that needs `<base>__<id>` refused |
+| No `CREATE` on the database for the role, and no `<base>__<id>` | as above | refused; the message gives the `CREATE SCHEMA ... AUTHORIZATION` statement |
+
+### Upgrading
+
+1. Stop every process that writes the database, as in
+   [Coordinated upgrade](#coordinated-upgrade), including module stores and
+   `openminion storage migrate`.
+2. Take a full `pg_dump` of the database, and check that it restores into a
+   scratch database.
+3. Upgrade every process to the same package, then start them.
+4. A refusal writes nothing. To go back, install the previous package again;
+   the database is as it was.
+
+### Relocating a refused layout
+
+OpenMinion never moves, repairs or restamps tables itself. The steps below
+are for the operator, with every OpenMinion process stopped and a verified
+full `pg_dump`. Each block runs in one transaction. Indexes, constraints,
+triggers and owned sequences move with their tables. The examples use the
+base schema `public`.
+
+**R1. A module's dedicated history, when runtime storage must use the base
+schema.** Move the tables the refusal names as part of the module's history,
+with `alembic_version` and `om_meta`, unchanged, to `<base>__<module id>`.
+For a memory history at `0004_namespace` written by the memory store:
+
+<!-- 446:R1 -->
+```sql
+BEGIN;
+CREATE SCHEMA "public__memory";
+ALTER TABLE public.memory_records SET SCHEMA "public__memory";
+ALTER TABLE public.memory_candidates SET SCHEMA "public__memory";
+ALTER TABLE public.memory_entities SET SCHEMA "public__memory";
+ALTER TABLE public.memory_tier_transitions SET SCHEMA "public__memory";
+ALTER TABLE public.memory_relations SET SCHEMA "public__memory";
+ALTER TABLE public.memory_capture_bundle_receipts SET SCHEMA "public__memory";
+ALTER TABLE public.migrations SET SCHEMA "public__memory";
+ALTER TABLE public.alembic_version SET SCHEMA "public__memory";
+ALTER TABLE public.om_meta SET SCHEMA "public__memory";
+ALTER FUNCTION public.memory_records_search_trigger() SET SCHEMA "public__memory";
+COMMIT;
+```
+
+The memory store then opens `public__memory` at its recorded revision, and
+runtime storage starts in `public`. Before runtime storage has started in
+`public`, this inverse puts the history back as it was:
+
+<!-- 446:R1-inverse -->
+```sql
+BEGIN;
+ALTER TABLE "public__memory".memory_records SET SCHEMA public;
+ALTER TABLE "public__memory".memory_candidates SET SCHEMA public;
+ALTER TABLE "public__memory".memory_entities SET SCHEMA public;
+ALTER TABLE "public__memory".memory_tier_transitions SET SCHEMA public;
+ALTER TABLE "public__memory".memory_relations SET SCHEMA public;
+ALTER TABLE "public__memory".memory_capture_bundle_receipts SET SCHEMA public;
+ALTER TABLE "public__memory".migrations SET SCHEMA public;
+ALTER TABLE "public__memory".alembic_version SET SCHEMA public;
+ALTER TABLE "public__memory".om_meta SET SCHEMA public;
+ALTER FUNCTION "public__memory".memory_records_search_trigger() SET SCHEMA public;
+DROP SCHEMA "public__memory";
+COMMIT;
+```
+
+**R1b. Memory first, then runtime storage, which committed v1..v3.** The
+same as R1, except that `migrations` stays in `public`: it now holds runtime
+storage's rows. Runtime storage then resumes at v4.
+
+<!-- 446:R1b -->
+```sql
+BEGIN;
+CREATE SCHEMA "public__memory";
+ALTER TABLE public.memory_records SET SCHEMA "public__memory";
+ALTER TABLE public.memory_candidates SET SCHEMA "public__memory";
+ALTER TABLE public.memory_entities SET SCHEMA "public__memory";
+ALTER TABLE public.memory_tier_transitions SET SCHEMA "public__memory";
+ALTER TABLE public.memory_relations SET SCHEMA "public__memory";
+ALTER TABLE public.memory_capture_bundle_receipts SET SCHEMA "public__memory";
+ALTER TABLE public.alembic_version SET SCHEMA "public__memory";
+ALTER TABLE public.om_meta SET SCHEMA "public__memory";
+ALTER FUNCTION public.memory_records_search_trigger() SET SCHEMA "public__memory";
+CREATE TABLE "public__memory".migrations (LIKE public.migrations INCLUDING ALL);
+COMMIT;
+```
+
+**R2. A module whose ledger claims another owner's table.** A ledger that
+claimed another owner's table does not prove which revision the module's own
+tables are at, so they are not moved into `<base>__<module id>`. Park the
+module's own tables (the ones with its columns) with `alembic_version` and
+`om_meta` in a holding schema that is not named `<base>__<module id>`; the
+other owner's tables stay. For runtime storage, then the A2A audit store:
+
+<!-- 446:R2-park -->
+```sql
+BEGIN;
+CREATE SCHEMA a2a_hold;
+ALTER TABLE public.audit_records SET SCHEMA a2a_hold;
+ALTER TABLE public.a2a_audit_archive SET SCHEMA a2a_hold;
+ALTER TABLE public.agents SET SCHEMA a2a_hold;
+ALTER TABLE public.jobs SET SCHEMA a2a_hold;
+ALTER TABLE public.alembic_version SET SCHEMA a2a_hold;
+ALTER TABLE public.om_meta SET SCHEMA a2a_hold;
+COMMIT;
+```
+
+Then run `openminion storage migrate --backend postgres --postgres-url <url>
+--module a2a`, which creates `public__a2a` at its head revision, and copy the
+rows with explicit column lists, setting the identity sequences past the
+copied ids:
+
+<!-- 446:R2-copy -->
+```sql
+BEGIN;
+INSERT INTO "public__a2a".audit_records (id, record_date, ts, msg_id, trace_id, from_agent, to_agent, to_capability, type, method, status, task_id, error_code, error_message, envelope_json, data_json)
+SELECT id, record_date, ts, msg_id, trace_id, from_agent, to_agent, to_capability, type, method, status, task_id, error_code, error_message, envelope_json, data_json FROM a2a_hold.audit_records;
+INSERT INTO "public__a2a".a2a_audit_archive (id, record_date, source_file, ts, msg_id, trace_id, from_agent, to_agent, to_capability, type, method, status, task_id, error_code, error_message, envelope_json, data_json)
+SELECT id, record_date, source_file, ts, msg_id, trace_id, from_agent, to_agent, to_capability, type, method, status, task_id, error_code, error_message, envelope_json, data_json FROM a2a_hold.a2a_audit_archive;
+INSERT INTO "public__a2a".agents (agent_id, endpoint, capabilities_json, tags_json, status, updated_at)
+SELECT agent_id, endpoint, capabilities_json, tags_json, status, updated_at FROM a2a_hold.agents;
+INSERT INTO "public__a2a".jobs (task_id, trace_id, owner_agent_id, agent_id, method, idempotency_scope, idempotency_key, state, progress, current_step, result_inline_json, result_ref, error_json, created_at, updated_at, heartbeat_at)
+SELECT task_id, trace_id, owner_agent_id, agent_id, method, idempotency_scope, idempotency_key, state, progress, current_step, result_inline_json, result_ref, error_json, created_at, updated_at, heartbeat_at FROM a2a_hold.jobs;
+SELECT setval(pg_get_serial_sequence('"public__a2a".audit_records', 'id'), max(id)) FROM "public__a2a".audit_records HAVING max(id) IS NOT NULL;
+SELECT setval(pg_get_serial_sequence('"public__a2a".a2a_audit_archive', 'id'), max(id)) FROM "public__a2a".a2a_audit_archive HAVING max(id) IS NOT NULL;
+COMMIT;
+```
+
+Compare the row counts of each pair of tables, and keep `a2a_hold` until
+the copy is verified. These statements are for the A2A tables at
+`0005_job_idempotency_scope`; for an earlier revision the parked tables can
+lack columns that the copy lists, and the copy stops. Then restore the dump
+instead. With several modules behind one ledger, park them together and copy
+each one.
+
+**Going back after a relocation** means restoring the pre-upgrade dump with
+the previous package. The only tested inverse is R1's above, and only before
+runtime storage has started in the base schema. A layout where a module's
+migration changed runtime storage's own tables (for example columns added to
+its `memory_records` by `storage migrate --backend postgres` on the runtime
+URL) has no relocation here: restore a dump from before that command.
+
+### An empty `migrations` table
+
+A runtime storage start that fails before v1 leaves an empty `migrations`
+table; memory's baseline creates one too. An empty one proves neither, so
+runtime storage and memory refuse it, and OpenMinion never adopts or drops
+it. Before you remove it, find where it came from (the logs of the failed
+start, or a memory history next to it) and take a full `pg_dump`.
+
+### Permissions
+
+Creating `<base>__<module id>` needs `CREATE` on the database. A database
+administrator can instead create the empty schema for the role, which then
+needs nothing more:
+
+```sql
+CREATE SCHEMA "public__memory" AUTHORIZATION openminion_app;
+```
+
+An existing schema needs `USAGE` and `CREATE` for the role:
+`GRANT USAGE, CREATE ON SCHEMA "public__memory" TO openminion_app;`.
+
 ## SQLite runtime home backup
 
 `openminion storage backup --sqlite <file> --output <backup>` snapshots one
@@ -251,7 +493,8 @@ Not covered:
 
 - other runtime surfaces on PostgreSQL runtime storage;
 - `openminion storage migrate --backend postgres` and module PostgreSQL
-  migrations;
+  migrations, except where each owner's tables go: see
+  [PostgreSQL schemas per owner](#postgresql-schemas-per-owner);
 - the module stores under the data root (for example `brain/sessions.db` and
   `memory/memory.db`): they are SQLite files on both backends, because
   `storage.backend` does not select them.
