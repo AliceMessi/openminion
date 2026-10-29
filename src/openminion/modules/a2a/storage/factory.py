@@ -64,15 +64,19 @@ def build_a2a_audit_store(
     # The a2a module's own schema under the configured base schema (#446).
     selection = select_postgres_module_schema(url, "a2a")
     engine = create_engine(selection.url(url), future=True)
-    return PostgresAuditStore(
-        engine,
-        capture_payloads=capture_payloads,
-        retention_days=retention_days,
-        archive_retention_days=archive_retention_days,
-        database_path=raw_audit_root / "audit.db",
-        owns_engine=True,
-        postgres_schema=selection,
-    )
+    try:
+        return PostgresAuditStore(
+            engine,
+            capture_payloads=capture_payloads,
+            retention_days=retention_days,
+            archive_retention_days=archive_retention_days,
+            database_path=raw_audit_root / "audit.db",
+            owns_engine=True,
+            postgres_schema=selection,
+        )
+    except BaseException:
+        engine.dispose()
+        raise
 
 
 def _require_postgres_backend(backend: str) -> None:

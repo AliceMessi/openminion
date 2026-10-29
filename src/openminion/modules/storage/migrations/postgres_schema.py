@@ -8,13 +8,15 @@ they shared ``alembic_version`` and ``om_meta`` and adopted each other's tables 
 - each module uses its own schema, ``<base>__<module id>``;
 - a module whose history is already in the base schema keeps using it, with no move and no stamp.
 
-An owner's history in a schema is proven only by its ledger together with an exact match of one of
-the histories listed in ``postgres_histories.json``: the same tables, each with the same columns,
-types, NOT NULL and primary key. The ledger is the ``migrations`` rows v1..vk for runtime storage, and
-for a module ``om_meta.module_id`` with its ``alembic_version`` row, or with ``om_meta.schema_head``
-for a store that has no Alembic ledger. The listed histories were measured from published packages
-and from this code. Anything unproven, or a table that two recorded histories include, is refused
-before any write; the message names the tables and the listed histories that include them.
+The evidence is an owner's ledger together with exact tables. The ledger is the ``migrations``
+rows v1..vk for runtime storage, and for a module ``om_meta.module_id`` with its
+``alembic_version`` row, or with ``om_meta.schema_head`` for a store that has no Alembic ledger.
+A table belongs to an owner when that owner's ledger is recorded in the schema and a history
+listed for that ledger in ``postgres_histories.json`` has the table with the same columns, types,
+NOT NULL and primary key. An owner's history there is proven when every table of one listed
+history is present, belongs to that owner alone, and the owner has no other table there. A table
+an owner would create or read that is not proven its own is refused before any write; owners
+that use none of the refused table names are not affected.
 
 The checks read only catalogs and ledger rows, with explicit schema names, in one READ ONLY
 transaction.
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
 RUNTIME = "runtime"
 _HISTORIES_FILE = Path(__file__).with_name("postgres_histories.json")
 _LEDGER_TABLES = frozenset({"alembic_version", "om_meta"})
+_INTEGER_TYPES = frozenset({"smallint", "integer", "bigint"})
 _SAFE_NAME = re.compile(r"[A-Za-z0-9_]+")
 _NOTHING_WRITTEN = (
     "Nothing was written. OpenMinion does not move, repair or restamp existing tables."
@@ -61,11 +64,6 @@ class History:
     tables: dict[str, str]  # table -> signature
     measured: tuple[str, ...]
 
-    @property
-    def label(self) -> str:
-        name = "runtime storage" if self.owner == RUNTIME else self.owner
-        return f"{name} {self.ledger}"
-
 
 @dataclass(frozen=True)
 class _Catalog:
@@ -74,6 +72,7 @@ class _Catalog:
     histories: dict[str, dict[str, tuple[History, ...]]]  # owner -> ledger -> histories
     names: dict[str, frozenset[str]]  # owner -> every table name in its histories
     signatures: dict[str, frozenset[str]]  # "owner/table" -> every listed signature
+    bootstrap: dict[str, frozenset[str]]  # "owner/table" -> this code's store tables
 
 
 @lru_cache(maxsize=1)
@@ -96,35 +95,41 @@ def _catalog() -> _Catalog:
     }
     names: dict[str, frozenset[str]] = {}
     sigs: dict[str, set[str]] = {}
+    bootstrap: dict[str, set[str]] = {}
     for owner, ledgers in histories.items():
         names[owner] = frozenset(
             table for items in ledgers.values() for h in items for table in h.tables
         )
         for items in ledgers.values():
             for h in items:
+                store = h.ledger.startswith("store ") and "current" in h.measured
                 for table, signature in h.tables.items():
                     sigs.setdefault(f"{owner}/{table}", set()).add(signature)
+                    if store:
+                        bootstrap.setdefault(f"{owner}/{table}", set()).add(signature)
     return _Catalog(
         engine_tables=frozenset(data["engine_tables"]),
         runtime_versions={int(k): v for k, v in data["runtime_versions"].items()},
         histories=histories,
         names=names,
         signatures={key: frozenset(value) for key, value in sigs.items()},
+        bootstrap={key: frozenset(value) for key, value in bootstrap.items()},
     )
 
 
-def supported_owners() -> tuple[str, ...]:
-    return tuple(sorted(_catalog().histories))
-
-
 def alembic_head(module_id: str) -> str | None:
-    """The newest Alembic ledger this code lists for ``module_id`` ("alembic <revision>")."""
-    ledgers = [
-        ledger
-        for ledger, items in _catalog().histories.get(module_id, {}).items()
-        if ledger.startswith("alembic ") and any("current" in h.measured for h in items)
-    ]
-    return max(ledgers) if ledgers else None
+    """``alembic <revision>`` for the head of the module's Alembic chain in this code."""
+    from alembic.script import ScriptDirectory
+
+    from openminion.modules.storage.migrations.alembic import (
+        discover_module_alembic_paths,
+    )
+
+    _, location = discover_module_alembic_paths(module_id)
+    if location is None:
+        return None
+    head = ScriptDirectory(str(location)).get_current_head()
+    return None if head is None else f"alembic {head}"
 
 
 @dataclass(frozen=True)
@@ -166,7 +171,11 @@ class SchemaLayout:
 
 @dataclass(frozen=True)
 class ModuleSchema:
-    """Where a module keeps its PostgreSQL tables."""
+    """Where a module keeps its PostgreSQL tables.
+
+    Only this module's selection functions build one from what they read. A caller that hands
+    one to ``MigrationRunner(postgres_schema=...)`` or a store vouches for it: it is used as is.
+    """
 
     module_id: str
     base: str
@@ -207,6 +216,11 @@ def read_schema(connection: Connection, schema: str) -> SchemaLayout:
     if row is None:
         return SchemaLayout(name=schema, exists=False)
     oid, owner, usage, create = row
+    if not usage:
+        # Its ledger rows cannot be read; the caller refuses it with the GRANT to run.
+        return SchemaLayout(
+            name=schema, exists=True, owner=str(owner), create=bool(create)
+        )
     known = {n for names in _catalog().names.values() for n in names} | _LEDGER_TABLES
     names = [
         r[0]
@@ -260,12 +274,12 @@ def read_schema(connection: Connection, schema: str) -> SchemaLayout:
         name=schema,
         exists=True,
         tables=tables,
-        alembic=_ledger_rows(connection, schema, columns, "alembic_version"),
+        alembic=_alembic_rows(connection, schema, columns),
         om_meta=_om_meta(connection, schema, columns),
         migrations=_runtime_rows(connection, schema, columns),
         objects=int(objects),
         owner=str(owner),
-        usage=bool(usage),
+        usage=True,
         create=bool(create),
     )
 
@@ -279,23 +293,22 @@ def signature(columns: list[tuple[str, str, bool]], primary_key: list[str]) -> s
     return f"{cols}; pk({', '.join(sorted(primary_key))})"
 
 
-def _has(
-    columns: dict[str, list[tuple[str, str, bool]]], table: str, *names: str
-) -> bool:
-    return set(names) <= {c[0] for c in columns.get(table, [])}
+def _column_types(
+    columns: dict[str, list[tuple[str, str, bool]]], table: str
+) -> dict[str, str]:
+    return {name: typ for name, typ, _ in columns.get(table, [])}
 
 
-def _ledger_rows(
+def _alembic_rows(
     connection: Connection,
     schema: str,
     columns: dict[str, list[tuple[str, str, bool]]],
-    table: str,
 ) -> tuple[str, ...] | None:
     from sqlalchemy import text
 
-    if table not in columns:
+    if "alembic_version" not in columns:
         return None
-    if not _has(columns, table, "version_num"):
+    if "version_num" not in _column_types(columns, "alembic_version"):
         return ("<alembic_version without version_num>",)
     rows = connection.execute(
         text(f"SELECT version_num FROM {_quote(schema)}.alembic_version")
@@ -312,7 +325,7 @@ def _om_meta(
 
     if "om_meta" not in columns:
         return None
-    if not _has(columns, "om_meta", "key", "value"):
+    if not {"key", "value"} <= set(_column_types(columns, "om_meta")):
         return {"module_id": "<om_meta without key/value>"}
     rows = connection.execute(
         text(
@@ -328,11 +341,12 @@ def _runtime_rows(
     schema: str,
     columns: dict[str, list[tuple[str, str, bool]]],
 ) -> tuple[tuple[int, str], ...] | None:
+    """Runtime storage's ledger rows; None when ``migrations`` cannot hold them."""
     from sqlalchemy import text
 
-    if "migrations" not in columns or not _has(
-        columns, "migrations", "version", "name"
-    ):
+    types = _column_types(columns, "migrations")
+    if types.get("version") not in _INTEGER_TYPES or "name" not in types:
+        # Not runtime storage's table: its signature then matches no runtime history.
         return None
     rows = connection.execute(
         text(f"SELECT version, name FROM {_quote(schema)}.migrations ORDER BY version")
@@ -340,7 +354,15 @@ def _runtime_rows(
     return tuple((int(r[0]), str(r[1])) for r in rows)
 
 
-# ---------------------------------------------------------------------------- histories
+# ---------------------------------------------------------------------------- evidence
+
+
+def _name(owner: str) -> str:
+    return "runtime storage" if owner == RUNTIME else owner
+
+
+def _label(owner: str, layout: SchemaLayout) -> str:
+    return f"{_name(owner)} {layout.ledger(owner)}"
 
 
 def complete_history(owner: str, layout: SchemaLayout) -> History | None:
@@ -363,103 +385,89 @@ def complete_history(owner: str, layout: SchemaLayout) -> History | None:
 
 
 def _owned_tables(owner: str, layout: SchemaLayout) -> set[str]:
+    """The tables in ``layout`` whose names ``owner`` creates or reads."""
     return {t for t in layout.tables if t in _catalog().names.get(owner, frozenset())}
 
 
-def _claims(layout: SchemaLayout) -> dict[str, list[History]]:
-    """Table -> the complete histories that include it, over every listed owner."""
-    claims: dict[str, list[History]] = {}
-    for owner in _catalog().histories:
-        history = complete_history(owner, layout)
-        if history is not None:
-            for table in history.tables:
-                claims.setdefault(table, []).append(history)
-    return claims
+def _attribution(layout: SchemaLayout) -> dict[str, list[str]]:
+    """Table -> the owners it belongs to, each table on its own.
+
+    A table belongs to owner O when O's ledger is recorded in the schema and a history listed
+    for that ledger has the table with exactly these columns.
+    """
+    catalog = _catalog()
+    result: dict[str, list[str]] = {}
+    for owner in sorted(catalog.histories, key=lambda o: (o != RUNTIME, o)):
+        ledger = layout.ledger(owner)
+        listed = catalog.histories[owner].get(ledger or "", ())
+        for table, sig in layout.tables.items():
+            if sig is not None and any(h.tables.get(table) == sig for h in listed):
+                result.setdefault(table, []).append(owner)
+    return result
 
 
-def _matching_histories(table: str, sig: str | None) -> str:
-    """The listed histories that include ``table`` with exactly ``sig``, as ranges."""
-    groups: dict[tuple[str, str], list[str]] = {}
-    for owner, ledgers in sorted(_catalog().histories.items()):
-        for ledger, items in ledgers.items():
-            if any(h.tables.get(table) == sig for h in items):
-                kind, _, revision = ledger.rpartition(" ")
-                key = (items[0].label.rsplit(" ", 1)[0], kind)
-                if revision not in groups.setdefault(key, []):
-                    groups[key].append(revision)
-    return ", ".join(
-        f"{name} {revisions[0]}" + (f"..{revisions[-1]}" if len(revisions) > 1 else "")
-        for (name, _kind), revisions in groups.items()
-    )
-
-
-def _describe(
-    table: str, layout: SchemaLayout, claims: dict[str, list[History]]
-) -> str:
-    holders = claims.get(table, [])
-    if holders:
-        return f"{table} (part of {' and '.join(h.label for h in holders)})"
-    matches = _matching_histories(table, layout.tables.get(table))
-    if not matches:
-        return f"{table} (matches no listed history)"
-    return f"{table} (its columns match {matches}; no ledger here records that history)"
-
-
-def _proven_in_place(
-    owner: str, layout: SchemaLayout, claims: dict[str, list[History]]
+def _proven(
+    owner: str, layout: SchemaLayout, attribution: dict[str, list[str]]
 ) -> History | None:
+    """The owner's listed history in ``layout`` when it is proven, else None.
+
+    Every table of the history is there exactly and belongs to the owner alone, and no other
+    table with one of the owner's names is there.
+    """
     history = complete_history(owner, layout)
     if history is None or _owned_tables(owner, layout) != set(history.tables):
         return None
-    if any(claims.get(t, []) != [history] for t in history.tables):
+    if any(attribution.get(t) != [owner] for t in history.tables):
         return None
     return history
 
 
-def _unproven(
-    owner: str, layout: SchemaLayout, claims: dict[str, list[History]]
+def _facts(
+    owner: str,
+    layout: SchemaLayout,
+    attribution: dict[str, list[str]],
+    tables: list[str] | None = None,
 ) -> str:
-    """Why ``owner``'s objects in ``layout`` are not a proven history, for a refusal."""
-    name = "runtime storage" if owner == RUNTIME else owner
-    owned = _owned_tables(owner, layout)
+    """Why ``owner``'s tables in ``layout`` (or just ``tables``) are not its own, as facts."""
+    catalog = _catalog()
+    name = _name(owner)
     ledger = layout.ledger(owner)
-    listed = _catalog().histories.get(owner, {}).get(ledger or "", ())
-    history = complete_history(owner, layout)
-    reasons: list[str] = []
-    explained: set[str] = set()
+    listed = catalog.histories.get(owner, {}).get(ledger or "", ())
     if ledger is None:
-        reasons.append(f"no {name} ledger is recorded there")
+        facts = [f"no {name} ledger is recorded there"]
     elif not listed:
-        reasons.append(
-            f"its ledger records {ledger}, which is not a listed {name} history"
-        )
-    elif history is None:
-        closest = max(
-            listed,
-            key=lambda h: sum(layout.tables.get(t) == g for t, g in h.tables.items()),
-        )
-        missing = sorted(t for t in closest.tables if t not in layout.tables)
-        differ = sorted(
-            t
-            for t in closest.tables
-            if t in layout.tables
-            and t not in missing
-            and layout.tables[t] != closest.tables[t]
-        )
-        parts = [f"{t} has other columns" for t in differ] + [
-            f"{t} is missing" for t in missing
-        ]
-        reasons.append(f"its ledger records {closest.label}, but " + ", ".join(parts))
-        explained = set(closest.tables)
-    for table in sorted(owned - explained):
-        if (
-            history is not None
-            and table in history.tables
-            and claims.get(table) == [history]
-        ):
+        facts = [f"its {name} ledger records {ledger}, which is not a listed history"]
+    else:
+        facts = [f"its {name} ledger records {ledger}"]
+        common = set.intersection(*(set(h.tables) for h in listed))
+        facts += [f"{t} is missing" for t in sorted(common - set(layout.tables))]
+    for table in sorted(_owned_tables(owner, layout) if tables is None else tables):
+        holders = attribution.get(table, [])
+        if holders == [owner]:
             continue
-        reasons.append(_describe(table, layout, claims))
-    return "; ".join(reasons)
+        if holders:
+            labels = " and ".join(_label(o, layout) for o in holders)
+            facts.append(f"{table} is recorded by {labels}")
+        elif any(table in h.tables for h in listed):
+            facts.append(f"{table} has other columns than {name} {ledger} lists")
+        else:
+            sig = layout.tables[table]
+            listed_for = [
+                _name(o)
+                for o in sorted(catalog.names)
+                if sig in catalog.signatures.get(f"{o}/{table}", frozenset())
+            ]
+            facts.append(
+                f"{table} matches no recorded ledger ("
+                + (
+                    f"its columns are listed for {', '.join(listed_for)})"
+                    if listed_for
+                    else "its columns match no listed history)"
+                )
+            )
+    if len(facts) == 1 and listed:
+        facts.append(f"its tables are not one listed {name} {ledger} history")
+    return "; ".join(facts)
 
 
 # ---------------------------------------------------------------------------- decisions
@@ -469,13 +477,13 @@ def runtime_refusal(layout: SchemaLayout) -> str | None:
     """None when runtime storage can use the base schema, else the refusal message."""
     if not _owned_tables(RUNTIME, layout):
         return None
-    claims = _claims(layout)
-    if _proven_in_place(RUNTIME, layout, claims) is not None:
+    attribution = _attribution(layout)
+    if _proven(RUNTIME, layout, attribution) is not None:
         return None
     return (
         f"Runtime storage will not use PostgreSQL schema {_quote(layout.name)}: tables it "
         f"creates or reads there are not provably its own: "
-        f"{_unproven(RUNTIME, layout, claims)}. {_NOTHING_WRITTEN} {_GUIDANCE}"
+        f"{_facts(RUNTIME, layout, attribution)}. {_NOTHING_WRITTEN} {_GUIDANCE}"
     )
 
 
@@ -525,30 +533,41 @@ def decide_module_schema(
     role: str,
     database_create: bool,
 ) -> ModuleSchema:
-    """Choose the module's schema from the configured base schema; raise when unproven."""
-    claims = _claims(base)
-    owned = _owned_tables(module_id, base)
-    disputed = sorted(
+    """Choose the module's schema from the configured base schema; raise when unproven.
+
+    A base table with one of the module's names concerns the module unless it belongs to
+    other owners only.
+    """
+    attribution = _attribution(base)
+    unproven = sorted(
         t
-        for t in owned
-        if len(claims.get(t, [])) != 1 or claims[t][0].owner == module_id
+        for t in _owned_tables(module_id, base)
+        if module_id in attribution.get(t, [module_id])
     )
-    if (base.om_meta or {}).get("module_id") == module_id or disputed:
+    recorded = (base.om_meta or {}).get("module_id") == module_id
+    if recorded or unproven:
+        if not recorded and _proven_derived(module_id, derived, role=role):
+            # The module already uses its own schema; it never reads these base tables.
+            return ModuleSchema(
+                module_id, base.name, derived.name, ledger=derived.ledger(module_id)
+            )
         if derived.exists:
             raise SchemaOwnershipError(
                 f"Module {module_id!r} has objects in both {_quote(base.name)} "
-                f"({', '.join(disputed) or 'its om_meta ledger'}) and {_quote(derived.name)}; "
-                "neither is selected. Keep one location, and move the other to a schema "
-                f"that is not named <base>__<module id>. {_NOTHING_WRITTEN} {_GUIDANCE}"
+                f"({', '.join(unproven) or 'its om_meta ledger'}) and "
+                f"{_quote(derived.name)}; neither is selected. Keep one location, and move "
+                "the other to a schema that is not named <base>__<module id>. "
+                f"{_NOTHING_WRITTEN} {_GUIDANCE}"
             )
-        if _proven_in_place(module_id, base, claims) is not None:
+        if _proven(module_id, base, attribution) is not None:
             return ModuleSchema(
                 module_id, base.name, base.name, ledger=base.ledger(module_id)
             )
         raise SchemaOwnershipError(
             f"Module {module_id!r} will not use PostgreSQL schema {_quote(base.name)}: "
-            f"its objects there are not provably its own: "
-            f"{_unproven(module_id, base, claims)}. {_NOTHING_WRITTEN} {_GUIDANCE}"
+            f"its tables there are not provably its own: "
+            f"{_facts(module_id, base, attribution, None if recorded else unproven)}. "
+            f"{_NOTHING_WRITTEN} {_GUIDANCE}"
         )
     problem = _name_problem(derived.name)
     if problem is not None:
@@ -568,7 +587,7 @@ def decide_module_schema(
                 f"{_NOTHING_WRITTEN}"
             )
         return ModuleSchema(module_id, base.name, derived.name, create=True)
-    refusal = derived_refusal(module_id, derived, role=role)
+    refusal = _derived_refusal(module_id, derived, role=role)
     if refusal is not None:
         raise SchemaOwnershipError(refusal)
     return ModuleSchema(
@@ -576,13 +595,22 @@ def decide_module_schema(
     )
 
 
-def derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str | None:
+def _proven_derived(module_id: str, layout: SchemaLayout, *, role: str) -> bool:
+    """Whether ``<base>__<module id>`` holds the module's ledger and is selectable."""
+    return (
+        layout.exists
+        and layout.ledger(module_id) is not None
+        and _derived_refusal(module_id, layout, role=role) is None
+    )
+
+
+def _derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str | None:
     """None when an existing schema holds nothing but ``module_id``'s own objects.
 
     That is: nothing at all (a schema a database administrator created); the module's proven
-    history; or, with no ledger yet (a store bootstrap that stopped before writing ``om_meta``),
-    only tables whose names and exact columns are listed for the module. The storage engine's
-    own tables are allowed in every case.
+    history; or, with no ledger yet, only tables that this code's store bootstrap for the module
+    creates, each exact (a bootstrap that stopped before it wrote ``om_meta``). The storage
+    engine's own tables are allowed in every case.
     """
     if not (layout.usage and layout.create):
         return (
@@ -621,22 +649,23 @@ def derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str |
         # stopped before its first table, or a module downgraded to base.
         return None
     if layout.alembic or meta == module_id:
-        claims = _claims(layout)
-        if _proven_in_place(module_id, layout, claims) is not None:
+        attribution = _attribution(layout)
+        if _proven(module_id, layout, attribution) is not None:
             return None
         return (
             f"{where} is not provably {module_id}'s: "
-            f"{_unproven(module_id, layout, claims)}. {_NOTHING_WRITTEN}"
+            f"{_facts(module_id, layout, attribution)}. {_NOTHING_WRITTEN}"
         )
-    wrong = sorted(
+    other = sorted(
         t
         for t, sig in tables.items()
-        if sig not in catalog.signatures.get(f"{module_id}/{t}", frozenset())
+        if sig not in catalog.bootstrap.get(f"{module_id}/{t}", frozenset())
     )
-    if wrong:
+    if other:
         return (
-            f"{where} holds tables whose columns match no listed {module_id} history: "
-            f"{', '.join(wrong)}. {_NOTHING_WRITTEN}"
+            f"{where} has no {module_id} ledger, and these tables are not ones this code's "
+            f"{module_id} store creates, with the same columns: {', '.join(other)}. "
+            f"{_NOTHING_WRITTEN}"
         )
     return None
 
@@ -691,11 +720,10 @@ def check_module_connection(engine: Engine, module_id: str) -> ModuleSchema:
             )
         role = str(connection.execute(_sql("SELECT current_user")).scalar_one())
         layout = read_schema(connection, name)
-    claims = _claims(layout)
     ledger = layout.ledger(module_id)
-    if _proven_in_place(module_id, layout, claims) is not None:
+    if _proven(module_id, layout, _attribution(layout)) is not None:
         return ModuleSchema(module_id, name, name, ledger=ledger)
-    refusal = derived_refusal(module_id, layout, role=role)
+    refusal = _derived_refusal(module_id, layout, role=role)
     if refusal is None:
         return ModuleSchema(module_id, name, name, ledger=ledger)
     raise SchemaOwnershipError(refusal)
@@ -722,31 +750,38 @@ def module_url(url: str, schema: str) -> str:
         from openminion.base.config.env import resolve_environment_config
 
         current = str(resolve_environment_config().get("PGOPTIONS", "") or "")
-    existing = current
-    options = f'{existing} -c search_path="{schema}"'.strip()
+    options = f'{current} -c search_path="{schema}"'.strip()
     return parsed.update_query_dict({"options": options}).render_as_string(
         hide_password=False
     )
 
 
-def require_connection_schema(engine: Engine, schema: str) -> None:
-    """Fail closed when a connection does not land in ``schema`` (a proxy that drops options)."""
-    with engine.connect() as connection:
-        current = _current_schema(connection)
-    if current != schema:
+def _require_landing(url: str, schema: str) -> None:
+    """Refuse, before any write, a module URL whose connections would not use ``schema``.
+
+    Reads the connection's ``search_path`` setting, so it works before the schema exists. A
+    server or a proxy that drops the URL's ``options`` leaves the default instead.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    probe = create_engine(url, poolclass=NullPool)
+    try:
+        with _read_only(probe) as connection:
+            setting = str(
+                connection.execute(
+                    _sql("SELECT current_setting('search_path')")
+                ).scalar_one()
+            )
+    finally:
+        probe.dispose()
+    if setting.strip() not in (schema, _quote(schema)):
         raise SchemaOwnershipError(
-            f"A module connection selected schema {current!r} instead of {schema!r}; the "
-            "server or a proxy did not apply the options parameter. "
-            f"{_NOTHING_WRITTEN}"
+            f"A connection for PostgreSQL schema {_quote(schema)} started with search_path "
+            f"{setting!r}: the server or a proxy (a transaction pooler such as PgBouncer) "
+            "did not apply the URL's options parameter. Connect module stores directly or "
+            f"through a pooler that passes options. {_NOTHING_WRITTEN}"
         )
-
-
-def create_module_schema(engine: Engine, selection: ModuleSchema) -> None:
-    """Create a selected derived schema in its own transaction (store bootstraps)."""
-    if not selection.create:
-        return
-    with engine.begin() as connection:
-        connection.execute(_sql(f"CREATE SCHEMA {_quote(selection.schema)}"))
 
 
 def enter_module_schema(connection: Connection, selection: ModuleSchema) -> None:
@@ -759,10 +794,11 @@ def enter_module_schema(connection: Connection, selection: ModuleSchema) -> None
 def select_postgres_module_schema(
     url: str, module_id: str, *, create: bool = False
 ) -> ModuleSchema:
-    """:func:`select_module_schema` for a configured URL, on a short-lived connection.
+    """:func:`select_module_schema` for a configured URL, on short-lived connections.
 
-    With ``create`` a selected derived schema is also created, in its own transaction, and a
-    connection with the module URL must land in it.
+    For the module's own schema, a connection with the module URL must start in it; that is
+    checked before any write. With ``create`` a missing schema is created in its own
+    transaction and the choice is made again.
     """
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
@@ -770,18 +806,19 @@ def select_postgres_module_schema(
     probe = create_engine(url, poolclass=NullPool)
     try:
         selection = select_module_schema(probe, module_id)
-        if create:
-            create_module_schema(probe, selection)
+        if selection.in_place:
+            return selection
+        _require_landing(selection.url(url), selection.schema)
+        if create and selection.create:
+            with probe.begin() as connection:
+                connection.execute(
+                    _sql(f"CREATE SCHEMA IF NOT EXISTS {_quote(selection.schema)}")
+                )
+            # Another process may have created and used it meanwhile.
+            selection = select_module_schema(probe, module_id)
     finally:
         probe.dispose()
-    if not create or selection.in_place:
-        return selection
-    scoped = create_engine(selection.url(url), poolclass=NullPool)
-    try:
-        require_connection_schema(scoped, selection.schema)
-    finally:
-        scoped.dispose()
-    return replace(selection, create=False)
+    return selection
 
 
 def module_storage_config(
@@ -795,7 +832,8 @@ def module_storage_config(
     selection = select_postgres_module_schema(url, module_id, create=True)
     head = alembic_head(module_id)
     if (selection.ledger or "").startswith("alembic ") and selection.ledger != head:
-        # The store's own DDL would move the tables past the recorded revision.
+        # The store's own CREATE TABLE IF NOT EXISTS would add the head's tables under an
+        # older alembic_version, a layout `storage migrate` could no longer upgrade.
         raise SchemaOwnershipError(
             f"Module {module_id!r}: PostgreSQL schema {_quote(selection.schema)} records "
             f"{selection.ledger}, behind this code's {head}. Run `openminion storage "
@@ -835,26 +873,15 @@ def _read_only(engine: Engine) -> Iterator[Connection]:
 
 
 __all__ = [
-    "History",
     "ModuleSchema",
-    "alembic_head",
     "SchemaLayout",
     "check_module_connection",
     "check_runtime_postgres_url",
-    "check_runtime_schema",
-    "complete_history",
-    "create_module_schema",
     "decide_module_schema",
-    "derived_refusal",
-    "derived_schema_name",
     "enter_module_schema",
     "module_storage_config",
     "module_url",
     "read_schema",
-    "require_connection_schema",
-    "runtime_refusal",
     "select_module_schema",
     "select_postgres_module_schema",
-    "signature",
-    "supported_owners",
 ]

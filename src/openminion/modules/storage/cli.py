@@ -822,7 +822,8 @@ def _run_a2a_archive_old(args: argparse.Namespace, env_map) -> int:
         select_postgres_module_schema,
     )
 
-    # The archive table belongs to the a2a module's own schema (#446).
+    # The archive table belongs to the a2a module's own schema (#446); a connection
+    # with the module URL is checked to start in it before any write.
     try:
         selection = select_postgres_module_schema(postgres_url, "a2a")
     except SchemaOwnershipError as exc:

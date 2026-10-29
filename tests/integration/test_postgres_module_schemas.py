@@ -3,9 +3,10 @@
 Runtime storage keeps the configured URL's schema (here `public` of a new
 database per test); each module uses `public__<module id>`; a module whose
 listed history is already in `public` stays there. Every refusal is checked
-to write nothing: a snapshot of the whole database (every schema's tables,
-columns, primary keys, row counts and an md5 of all rows, indexes, functions,
-triggers and sequence values) is the same before and after.
+to write nothing: a snapshot of every schema's tables (columns, nullability,
+row counts and an md5 of all rows), indexes, functions, triggers and sequence
+values is the same before and after. Views, constraints other than those
+indexes, column defaults and privileges are not part of the snapshot.
 
 Legacy layouts are built the way earlier code wrote them: a module's Alembic
 chain upgraded on a connection to `public`, the memory store on an engine for
@@ -22,6 +23,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,7 +38,8 @@ pytestmark = pytest.mark.postgres
 sa = pytest.importorskip("sqlalchemy")
 
 DOCS = Path(__file__).resolve().parents[2] / "docs" / "runtime-database-upgrades.md"
-NOW = "2026-10-29T00:00:00+00:00"
+# Audit records older than the A2A store's retention are deleted when it writes.
+NOW = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------- fixtures
@@ -450,6 +453,82 @@ def test_module_stores_on_the_runtime_url_use_their_own_schemas(
     assert {"public__session", "public__a2a"} <= set(_schemas(database))
 
 
+def test_runtime_storage_after_the_session_store_tried_its_url(
+    database: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On dev the session store, built on the runtime URL as api/queries/sessions.py
+    builds it, fails and leaves one index on runtime storage's sessions table. That
+    database upgrades: runtime storage proceeds and every module gets its own schema."""
+    from openminion.modules.session.runtime.factory import build_module_session_store
+    from openminion.modules.session.storage.store import PostgresSessionStore
+    from openminion.modules.storage.engine import StorageEngine
+
+    _start_runtime(database, tmp_path / "rt")
+    _runtime_rows(database)
+    # dev's factory: the storage engine for the configured URL, then the store on it.
+    engine = StorageEngine.from_config(config=_storage_config(database, tmp_path / "d"))
+    try:
+        with pytest.raises(Exception, match="session_id"):
+            PostgresSessionStore(
+                tmp_path / "d" / "sessions.db",
+                record_store=engine.record_store,
+                hybrid_store=engine.hybrid_store,
+                env={},
+            )
+    finally:
+        engine.close()
+    assert "idx_sessions_status_updated" in _scalars(
+        database, "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+    )
+
+    assert _start_runtime(database, tmp_path / "rt2") == 15
+    before = _snapshot(database)["public"]
+    result = _migrate(database, tmp_path, capsys)
+    assert {m: result[m]["status"] for m in WORKING_MODULES} == {
+        m: "ok" for m in WORKING_MODULES
+    }
+    sessions = build_module_session_store(
+        config=_storage_config(database, tmp_path / "s"),
+        database_path=tmp_path / "s" / "sessions.db",
+        env={},
+    )
+    try:
+        assert sessions.get_session(
+            sessions.create_session(
+                initial_agent_id="a", profile_version="v1", title="t", tags=[]
+            )
+        )
+    finally:
+        sessions.close()
+    assert _snapshot(database)["public"] == before
+
+
+def test_a_module_url_that_does_not_land_in_its_schema_is_refused(
+    database: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server or proxy that drops the URL's options: refused before any write."""
+    from openminion.modules.storage.migrations import postgres_schema
+
+    _start_runtime(database, tmp_path / "rt")
+    before = _snapshot(database)
+    # As if the options parameter never reached the server.
+    monkeypatch.setattr(postgres_schema, "module_url", lambda url, schema: url)
+    registry = _factory(
+        "openminion.modules.registry.storage", "build_registry_store", "r.db"
+    )
+
+    for build in (
+        lambda: _memory(database, tmp_path),
+        lambda: _a2a_audit(database, tmp_path / "a2a"),
+        lambda: registry(database, tmp_path / "r"),
+    ):
+        with pytest.raises(Exception) as refused:
+            build()
+        assert "did not apply the URL's options parameter" in str(refused.value)
+        assert "Nothing was written" in str(refused.value)
+    assert _snapshot(database) == before
+
+
 # ---------------------------------------------------------------------------- in place
 
 
@@ -543,50 +622,84 @@ def _two_locations(url: str, tmp_path: Path) -> None:
     _execute(url, 'CREATE SCHEMA "public__memory"')
 
 
+def _foreign_migrations_table(url: str, tmp_path: Path) -> None:
+    _execute(
+        url,
+        "CREATE TABLE public.migrations (version text PRIMARY KEY, name text)",
+        "INSERT INTO public.migrations VALUES ('2024_01_init', 'another tool')",
+    )
+
+
 LAYOUTS = {
-    # layout: (builder, refused owners, message fragments)
+    # layout: (builder, refused owners, message fragments, owners that still proceed)
     "memory-then-failed-runtime": (
         _memory_then_failed_runtime,
         ["runtime", "memory", "memory-store"],
-        ["migrations (part of runtime storage v3 and memory alembic 0004_namespace)"],
+        [
+            "migrations is recorded by runtime storage v3 and memory alembic "
+            "0004_namespace"
+        ],
+        ["secret", "registry"],
     ),
     "a2a-then-failed-runtime": (
         _a2a_then_failed_runtime,
         ["runtime", "memory"],
-        ["no runtime storage ledger", "migrations (its columns match"],
+        ["no runtime storage ledger", "migrations matches no recorded ledger"],
+        ["artifact"],
     ),
     "runtime-then-a2a-audit-store": (
         _runtime_then_a2a,
-        ["a2a", "a2a-audit-store", "registry"],
-        ["idempotency_keys has other columns"],
+        ["a2a", "a2a-audit-store"],
+        ["idempotency_keys is recorded by runtime storage v15"],
+        ["registry", "memory"],
     ),
     "artifact-then-registry": (
         _artifact_then_registry,
         ["artifact", "registry"],
         ["agents is missing", "no artifact ledger"],
+        ["secret"],
     ),
     "altered-runtime-table": (
         _altered_runtime_table,
         ["runtime", "session"],
-        ["sessions has other columns"],
+        [
+            "sessions has other columns than runtime storage v15 lists",
+            "sessions matches no recorded ledger",
+        ],
+        ["memory", "a2a"],
     ),
     "foreign-tables": (
         _foreign_tables,
         ["runtime", "session"],
-        ["sessions (matches no listed history)"],
+        ["sessions matches no recorded ledger (its columns match no listed history)"],
+        ["memory"],
+    ),
+    "foreign-migrations-table": (
+        _foreign_migrations_table,
+        ["runtime", "memory"],
+        ["migrations matches no recorded ledger (its columns match no listed history)"],
+        ["secret"],
     ),
     "two-locations": (
         _two_locations,
         ["memory", "memory-store"],
         ["neither is selected"],
+        ["secret"],
     ),
-    # A module store would move the tables past the recorded revision.
+    # A module store would add the head's tables under an older alembic_version.
     "store-on-a-history-behind-head": (
         _skill_behind_head,
         ["skill-store"],
         ["records alembic 0003_audit, behind this code's alembic 0007_workflow"],
+        [],
     ),
 }
+
+
+def _skill_store(url: str, root: Path):
+    return _factory("openminion.modules.skill.storage", "build_skill_store", "s.db")(
+        url, root
+    )
 
 
 def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
@@ -605,9 +718,7 @@ def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
         return str(refused.value)
     if owner == "skill-store":
         with pytest.raises(Exception) as refused:
-            _factory("openminion.modules.skill.storage", "build_skill_store", "s.db")(
-                url, tmp_path / "skill-again"
-            )
+            _skill_store(url, tmp_path / "skill-again")
         return str(refused.value)
     entry = _migrate(url, tmp_path, capsys, owner)
     assert entry["code"] == 1 and entry[owner]["status"] == "error", entry
@@ -618,7 +729,7 @@ def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
 def test_unproven_layouts_are_refused_without_writing(
     layout: str, database: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    build, refused, fragments = LAYOUTS[layout]
+    build, refused, fragments, unaffected = LAYOUTS[layout]
     build(database, tmp_path)
     capsys.readouterr()
     before = _snapshot(database)
@@ -631,17 +742,43 @@ def test_unproven_layouts_are_refused_without_writing(
         assert fragment in joined
     assert all("Nothing was written" in message for message in messages)
 
+    # Owners that use none of the refused table names still get their own schema.
+    for owner in unaffected:
+        assert _migrate(database, tmp_path, capsys, owner)[owner]["status"] == "ok"
+        assert _ledger(database, f"public__{owner}")[1] == owner
+    assert _snapshot(database)["public"] == before["public"]
 
-def test_a_refusal_does_not_stop_unrelated_owners(
+
+def test_a_store_behind_head_opens_after_storage_migrate(
     database: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _memory_then_failed_runtime(database, tmp_path)
-    public = _snapshot(database)["public"]
+    """The module store waits for `storage migrate`; opened first, it would strand skill."""
+    from openminion.modules.storage.migrations import postgres_schema
 
-    assert _migrate(database, tmp_path, capsys, "secret")["secret"]["status"] == "ok"
+    _skill_behind_head(database, tmp_path)
+    with pytest.raises(Exception, match="behind this code's alembic 0007"):
+        _skill_store(database, tmp_path / "s1")
 
-    assert _snapshot(database)["public"] == public
-    assert _ledger(database, "public__secret") == (["0001_baseline"], "secret")
+    assert _migrate(database, tmp_path, capsys, "skill")["skill"]["status"] == "ok"
+    store = _skill_store(database, tmp_path / "s2")
+    getattr(store, "close", lambda: None)()
+    assert _ledger(database, "public") == (["0007_workflow_observations"], "skill")
+    history = postgres_schema.complete_history("skill", _read(database, "public"))
+    assert history is not None and "current" in history.measured
+
+    # Without the guard (as on dev), the store adds the head's tables under 0003, a
+    # layout that is no listed history: from then on `storage migrate` refuses skill.
+    _execute(database, "CREATE SCHEMA stuck")
+    stuck = schema_url(database, "stuck")
+    _legacy_module(stuck, "skill", target="0003_audit")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(postgres_schema, "alembic_head", lambda _: "alembic 0003_audit")
+        try:
+            getattr(_skill_store(stuck, tmp_path / "s3"), "close", lambda: None)()
+        except Exception:  # noqa: BLE001 - a partial bootstrap strands it too
+            pass
+    entry = _migrate(stuck, tmp_path, capsys, "skill")["skill"]
+    assert entry["status"] == "error" and "not provably its own" in entry["error"]
 
 
 def test_a_failed_module_migration_leaves_no_schema(
@@ -906,8 +1043,76 @@ def _migrate_in(url: str, module_id: str, tmp_path: Path):
     return report
 
 
+def _all_signatures(url: str, schema: str) -> dict[str, str]:
+    """Every table's signature in ``schema``, also for names no listed history has."""
+    from openminion.modules.storage.migrations import postgres_schema
+
+    engine = sa.create_engine(url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+                    "a.attnotnull, coalesce(a.attnum = ANY(i.indkey), false) "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_attribute a ON a.attrelid = c.oid "
+                    "LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary "
+                    "WHERE n.nspname = :s AND c.relkind IN ('r', 'p') "
+                    "AND a.attnum > 0 AND NOT a.attisdropped"
+                ),
+                {"s": schema},
+            ).all()
+    finally:
+        engine.dispose()
+    columns: dict[str, list] = {}
+    keys: dict[str, list[str]] = {}
+    for table, name, typ, notnull, key in rows:
+        columns.setdefault(table, []).append((name, typ, bool(notnull)))
+        if key:
+            keys.setdefault(table, []).append(name)
+    return {
+        table: postgres_schema.signature(cols, keys.get(table, []))
+        for table, cols in columns.items()
+    }
+
+
+def _paste_ready(unlisted: list[tuple[str, str, dict[str, str]]]) -> str:
+    """Lines to add to postgres_histories.json for layouts this code builds."""
+    from openminion.modules.storage.migrations import postgres_schema
+
+    data = json.loads(postgres_schema._HISTORIES_FILE.read_text(encoding="utf-8"))  # noqa: SLF001
+    refs = {
+        (ref.rsplit("/", 1)[0], sig): ref for ref, sig in data["signatures"].items()
+    }
+    last: dict[str, int] = {}
+    for ref in data["signatures"]:
+        table, number = ref.rsplit("/", 1)
+        last[table] = max(last.get(table, 0), int(number))
+    signatures: dict[str, str] = {}
+    histories: list[str] = []
+    for owner, ledger, tables in unlisted:
+        names = []
+        for table, sig in sorted(tables.items()):
+            if (table, sig) not in refs:
+                last[table] = last.get(table, 0) + 1
+                refs[(table, sig)] = f"{table}/{last[table]}"
+                signatures[refs[(table, sig)]] = sig
+            names.append(refs[(table, sig)])
+        entry = {"owner": owner, "ledger": ledger, "tables": names}
+        histories.append(json.dumps({**entry, "measured": ["current"]}))
+    lines = ['Add to "signatures":']
+    lines += [f"{json.dumps(k)}: {json.dumps(v)}," for k, v in signatures.items()]
+    lines += ['Add to "histories" (or add "current" to an equal entry):']
+    lines += [f"{history}," for history in histories]
+    return "\n".join(lines)
+
+
 def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -> None:
-    """Every layout this code builds, one revision at a time, is listed as current."""
+    """Every layout this code builds, one revision at a time, is listed as current.
+
+    On a failure the message holds the postgres_histories.json lines to add (see
+    "PostgreSQL schemas per owner" in docs/runtime-database-upgrades.md).
+    """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
@@ -923,18 +1128,31 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
     )
 
     built: set[tuple[str, str]] = set()
-    missing: list[str] = []
+    unlisted: list[tuple[str, str, dict[str, str]]] = []
+    catalog = postgres_schema._catalog()  # noqa: SLF001
+    skip = catalog.engine_tables | {"alembic_version", "om_meta"}
 
-    def check(owner: str, layout) -> None:
+    def check(owner: str, schema: str) -> None:
+        layout = _read(database, schema)
         history = postgres_schema.complete_history(owner, layout)
-        ok = history is not None and "current" in history.measured
-        owned = {
-            t for t in layout.tables if t in postgres_schema._catalog().names[owner]
-        }  # noqa: SLF001
-        if not ok or owned != set(history.tables):
-            missing.append(f"{owner} {layout.ledger(owner)}: {sorted(owned)}")
-        else:
+        owned = {t for t in layout.tables if t in catalog.names[owner]}
+        if (
+            history is not None
+            and "current" in history.measured
+            and owned == set(history.tables)
+        ):
             built.add((owner, history.ledger))
+            return
+        if owner == postgres_schema.RUNTIME:
+            ledger = f"v{len(layout.migrations or ())}"
+        elif layout.alembic:
+            ledger = f"alembic {layout.alembic[0]}"
+        else:
+            ledger = f"store {(layout.om_meta or {}).get('schema_head')}"
+        tables = _all_signatures(database, schema)
+        unlisted.append(
+            (owner, ledger, {t: v for t, v in tables.items() if t not in skip})
+        )
 
     _execute(database, "CREATE SCHEMA rt")
     store = RecordStorePostgres(schema_url(database, "rt"))
@@ -942,7 +1160,7 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
         ordered = sorted(DEFAULT_MIGRATIONS, key=lambda m: m.version)
         for k in range(1, len(ordered) + 1):
             migrate_record_store(store, backend_type="postgres", migrations=ordered[:k])
-            check("runtime", _read(database, "rt"))
+            check("runtime", "rt")
     finally:
         store.close()
 
@@ -968,7 +1186,7 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
                     postgres_schema=ModuleSchema(module_id, schema, schema),
                 ).migrate(target=revision)
                 assert report.success, report.error
-                check(module_id, _read(database, schema))
+                check(module_id, schema)
         finally:
             engine.dispose()
 
@@ -988,7 +1206,7 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
             if order == "b":
                 # A failed upgrade rolls back and leaves the store's own layout.
                 _migrate_in(url, module_id, tmp_path)
-            check(module_id, _read(database, f"{base}__{module_id}"))
+            check(module_id, f"{base}__{module_id}")
 
     # The secret store has no PostgreSQL factory: it is built on a record store
     # its caller passes, in that record store's schema.
@@ -999,7 +1217,7 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
         record_store=RecordStorePostgres(schema_url(database, "b_secret"))
     )
     secret.close()
-    check("secret", _read(database, "b_secret"))
+    check("secret", "b_secret")
 
     listed = {
         (owner, ledger)
@@ -1007,7 +1225,7 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
         for ledger, items in ledgers.items()
         if any("current" in h.measured for h in items)
     }
-    assert missing == []
+    assert not unlisted, _paste_ready(unlisted)
     assert (sorted(listed - built), sorted(built - listed)) == ([], [])
 
 

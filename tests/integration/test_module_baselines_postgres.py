@@ -445,7 +445,10 @@ def test_existing_table_with_other_types_is_not_adopted(
 
     assert entry["exit"] == 1
     assert (entry["status"], entry["success"]) == ("error", False)
-    assert f"no {module_id} ledger is recorded there; {table_name} (" in entry["error"]
+    assert (
+        f"no {module_id} ledger is recorded there; {table_name} matches no recorded "
+        "ledger" in entry["error"]
+    )
     assert "Nothing was written" in entry["error"]
     assert _tables(schema) == [table_name]
 

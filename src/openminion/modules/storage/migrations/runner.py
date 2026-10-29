@@ -71,10 +71,12 @@ class MigrationRunner:
     ) -> None:
         """On PostgreSQL the module writes into one schema (#446).
 
-        ``postgres_schema`` is a schema its caller already selected. Otherwise, with
-        ``select_postgres_schema`` the engine is connected with the configured storage URL
-        and the runner selects the module's schema under it; without it the engine's own
-        current schema must hold the module's proven history or nothing but its objects.
+        ``postgres_schema`` is a schema its caller already selected with
+        ``postgres_schema.select_module_schema`` or ``select_postgres_module_schema``; the
+        runner trusts it and checks nothing more. Otherwise, with ``select_postgres_schema``
+        the engine is connected with the configured storage URL and the runner selects the
+        module's schema under it; without it the engine's own current schema must hold the
+        module's proven history or nothing but its objects.
         """
         self.module_id = module_id.strip()
         self.db_path = Path(db_path).expanduser().resolve(strict=False)

@@ -13,10 +13,7 @@ from openminion.modules.a2a.config import validate_audit_retention
 from openminion.modules.a2a.models import AuditRecord
 from openminion.modules.a2a.storage.base import AuditStore, audit_record_for_storage
 from openminion.modules.storage.migrations.module_ids import get_module_application_id
-from openminion.modules.storage.migrations.postgres_schema import (
-    ModuleSchema,
-    require_connection_schema,
-)
+from openminion.modules.storage.migrations.postgres_schema import ModuleSchema
 from openminion.modules.storage.migrations.runner import MigrationRunner
 from openminion.modules.storage.record_store import RecordStoreSQLite
 
@@ -299,10 +296,6 @@ class PostgresAuditStore(AuditStore):
         report = runner.migrate(target="head")
         if not report.success:
             raise RuntimeError(report.error or "A2A audit migration failed")
-        selection = self._postgres_schema
-        if selection is not None and not selection.in_place:
-            # The engine's own connections must land in the selected schema.
-            require_connection_schema(self._engine, selection.schema)
 
     def _enforce_retention(self, *, connection: Any | None = None) -> None:
         from sqlalchemy import text

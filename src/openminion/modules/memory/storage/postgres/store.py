@@ -18,10 +18,7 @@ from openminion.modules.artifact.refs import (
     remove_reference_edges,
 )
 from openminion.modules.storage.migrations.module_ids import get_module_application_id
-from openminion.modules.storage.migrations.postgres_schema import (
-    ModuleSchema,
-    require_connection_schema,
-)
+from openminion.modules.storage.migrations.postgres_schema import ModuleSchema
 from openminion.modules.storage.migrations.runner import MigrationRunner
 
 from ..base import MemoryStore
@@ -142,10 +139,6 @@ class PostgresMemoryStore(MemoryStore):
             raise MigrationRequiredError(
                 report.error or "Alembic migration failed for module 'memory'",
             )
-        selection = self._postgres_schema
-        if selection is not None and not selection.in_place:
-            # The engine's own connections must land in the selected schema.
-            require_connection_schema(self._engine, selection.schema)
         with self._engine.begin() as conn:
             conn.exec_driver_sql(
                 """

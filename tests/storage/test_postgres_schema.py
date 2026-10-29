@@ -47,6 +47,14 @@ def _memory_meta() -> dict[str, str]:
     return {"module_id": "memory", "schema_head": "0004_namespace"}
 
 
+def _a2a_meta() -> dict[str, str]:
+    return {"module_id": "a2a", "schema_head": "0005_job_idempotency_scope"}
+
+
+def _with_column(sig: str) -> str:
+    return sig.replace("; pk(", ", added_by_hand text; pk(")
+
+
 def _decide(
     module_id: str, base: ps.SchemaLayout, derived: ps.SchemaLayout | None = None
 ):
@@ -56,19 +64,28 @@ def _decide(
     )
 
 
-def _outcome(module_id: str, base: ps.SchemaLayout) -> str:
+def _outcome(
+    module_id: str, base: ps.SchemaLayout, derived: ps.SchemaLayout | None = None
+) -> str:
     try:
-        selection = _decide(module_id, base)
+        selection = _decide(module_id, base, derived)
     except SchemaOwnershipError:
         return "refused"
     return "in place" if selection.in_place else selection.schema
 
 
+def _refusal(
+    module_id: str, base: ps.SchemaLayout, derived: ps.SchemaLayout | None = None
+) -> str:
+    with pytest.raises(SchemaOwnershipError) as refused:
+        _decide(module_id, base, derived)
+    message = str(refused.value)
+    assert "Nothing was written" in message
+    return message
+
+
 def test_listed_histories_name_their_tables_and_sources() -> None:
     catalog = ps._catalog()
-    assert sorted(catalog.runtime_versions) == list(
-        range(1, len(catalog.runtime_versions) + 1)
-    )
     for owner, ledgers in catalog.histories.items():
         assert owner == ps.RUNTIME or owner in catalog.names
         for ledger, items in ledgers.items():
@@ -76,6 +93,36 @@ def test_listed_histories_name_their_tables_and_sources() -> None:
                 assert history.measured, (owner, ledger)
                 assert all(";" in sig for sig in history.tables.values())
     assert "core_events" in catalog.engine_tables
+
+
+def test_listed_histories_match_this_code() -> None:
+    """The file lists this code's runtime versions and every revision of each Alembic chain."""
+    from alembic.script import ScriptDirectory
+
+    from openminion.modules.storage.migrations.alembic import (
+        discover_module_alembic_paths,
+    )
+    from openminion.modules.storage.runtime.migrations import DEFAULT_MIGRATIONS
+
+    catalog = ps._catalog()
+    assert catalog.runtime_versions == {m.version: m.name for m in DEFAULT_MIGRATIONS}
+    assert set(catalog.histories[ps.RUNTIME]) == {
+        f"v{m.version}" for m in DEFAULT_MIGRATIONS
+    }
+    for owner, ledgers in catalog.histories.items():
+        if owner == ps.RUNTIME:
+            continue
+        _, location = discover_module_alembic_paths(owner)
+        assert location is not None, owner
+        chain = ScriptDirectory(str(location))
+        current = {
+            ledger
+            for ledger, items in ledgers.items()
+            if ledger.startswith("alembic ")
+            and any("current" in h.measured for h in items)
+        }
+        assert current == {f"alembic {s.revision}" for s in chain.walk_revisions()}
+        assert ps.alembic_head(owner) == f"alembic {chain.get_current_head()}"
 
 
 def test_fresh_base_schema_runtime_proceeds_and_modules_create_their_own() -> None:
@@ -118,7 +165,8 @@ def test_dedicated_module_history_stays_in_place_and_runtime_is_refused() -> Non
     )
     message = ps.runtime_refusal(base)
     assert message is not None
-    assert "memory_records (part of memory alembic 0004_namespace)" in message
+    assert "no runtime storage ledger is recorded there" in message
+    assert "memory_records is recorded by memory alembic 0004_namespace" in message
     assert "Nothing was written" in message
     assert _outcome("session", base) == "public__session"
 
@@ -134,14 +182,12 @@ def test_a_table_two_recorded_histories_include_refuses_both_owners() -> None:
         migrations=_runtime_rows(3),
     )
 
-    runtime = ps.runtime_refusal(base)
-    assert runtime is not None
-    assert (
-        "migrations (part of runtime storage v3 and memory alembic 0004_namespace)"
-        in runtime
+    shared = (
+        "migrations is recorded by runtime storage v3 and memory alembic 0004_namespace"
     )
-    with pytest.raises(SchemaOwnershipError, match="part of runtime storage v3 and"):
-        _decide("memory", base)
+    runtime = ps.runtime_refusal(base)
+    assert runtime is not None and shared in runtime
+    assert shared in _refusal("memory", base)
     # Owners that do not touch those names are not refused.
     assert _outcome("registry", base) == "public__registry"
     assert _outcome("session", base) == "public__session"
@@ -153,13 +199,17 @@ def test_an_empty_migrations_table_stays_refused() -> None:
     base = _layout(
         tables={**a2a.tables, "migrations": _runtime(1)["migrations"]},
         alembic=("0005_job_idempotency_scope",),
-        om_meta={"module_id": "a2a", "schema_head": "0005_job_idempotency_scope"},
+        om_meta=_a2a_meta(),
         migrations=(),
     )
 
     assert ps.runtime_refusal(base) is not None
-    with pytest.raises(SchemaOwnershipError, match="no memory ledger"):
-        _decide("memory", base)
+    message = _refusal("memory", base)
+    assert "no memory ledger is recorded there" in message
+    assert (
+        "migrations matches no recorded ledger (its columns are listed for memory, "
+        "runtime storage)" in message
+    )
     assert _outcome("a2a", base) == "in place"
     assert _outcome("artifact", base) == "public__artifact"
 
@@ -172,34 +222,49 @@ def test_a_ledger_that_claims_another_owners_table_is_refused() -> None:
     base = _layout(
         tables={**_runtime(15), **tables},
         alembic=("0005_job_idempotency_scope",),
-        om_meta={"module_id": "a2a", "schema_head": "0005_job_idempotency_scope"},
+        om_meta=_a2a_meta(),
         migrations=_runtime_rows(15),
     )
 
     assert ps.runtime_refusal(base) is None
-    with pytest.raises(
-        SchemaOwnershipError, match="idempotency_keys has other columns"
-    ):
-        _decide("a2a", base)
+    assert "idempotency_keys is recorded by runtime storage v15" in _refusal(
+        "a2a", base
+    )
     assert _outcome("memory", base) == "public__memory"
+    # registry shares the name agents, which A2A's ledger records with exactly these
+    # columns: the table is A2A's, so registry uses its own schema.
+    assert _outcome("registry", base) == "public__registry"
+
+
+def test_an_unproven_owner_does_not_refuse_an_owner_of_its_table_names() -> None:
+    # A2A in place with one altered table: A2A is refused; agents is still exactly
+    # the table A2A's ledger records, so registry is not.
+    a2a = dict(_history("a2a", "alembic 0005_job_idempotency_scope").tables)
+    a2a["jobs"] = _with_column(a2a["jobs"])
+    base = _layout(
+        tables=a2a, alembic=("0005_job_idempotency_scope",), om_meta=_a2a_meta()
+    )
+
+    assert "jobs has other columns than a2a alembic 0005_job_idempotency_scope" in (
+        _refusal("a2a", base)
+    )
+    assert _outcome("registry", base) == "public__registry"
 
 
 @pytest.mark.parametrize(
-    ("change", "expected"),
+    ("change", "expected", "session"),
     [
-        ("extra column", "sessions has other columns"),
-        ("missing column", "sessions has other columns"),
-        ("missing table", "room_participants is missing"),
+        ("extra column", "sessions has other columns", "refused"),
+        ("missing column", "sessions has other columns", "refused"),
+        ("missing table", "room_participants is missing", "public__session"),
     ],
 )
 def test_partial_subset_or_superset_tables_are_not_evidence(
-    change: str, expected: str
+    change: str, expected: str, session: str
 ) -> None:
     tables = _runtime(15)
     if change == "extra column":
-        tables["sessions"] = tables["sessions"].replace(
-            "; pk(", ", added_by_hand text; pk("
-        )
+        tables["sessions"] = _with_column(tables["sessions"])
     elif change == "missing column":
         tables["sessions"] = tables["sessions"].replace("channel text NOT NULL, ", "")
     else:
@@ -208,9 +273,52 @@ def test_partial_subset_or_superset_tables_are_not_evidence(
 
     message = ps.runtime_refusal(base)
     assert message is not None and expected in message
-    # Owners that touch those names are refused too; the others are not.
-    assert _outcome("session", base) == "refused"
-    assert _outcome("registry", base) == "public__registry"
+    # Only the owners that use a refused table name are refused: session uses
+    # sessions; memory and A2A use runtime storage's other names, which its ledger
+    # still records exactly.
+    assert _outcome("session", base) == session
+    assert {m: _outcome(m, base) for m in ("memory", "a2a", "registry")} == {
+        "memory": "public__memory",
+        "a2a": "public__a2a",
+        "registry": "public__registry",
+    }
+
+
+def test_a_module_already_in_its_own_schema_keeps_it() -> None:
+    # Runtime storage's sessions was altered after the session and memory modules moved
+    # to their own schemas: they keep them, and never read the base tables.
+    tables = _runtime(15)
+    tables["sessions"] = _with_column(tables["sessions"])
+    base = _layout(tables=tables, migrations=_runtime_rows(15))
+    session = _history("session", "alembic 0005_cron_scheduler_control")
+    memory = _history("memory", "alembic 0004_namespace")
+    derived = {
+        "session": _layout(
+            "public__session",
+            tables=session.tables,
+            alembic=("0005_cron_scheduler_control",),
+            om_meta={"module_id": "session", "schema_head": "x"},
+        ),
+        "memory": _layout(
+            "public__memory",
+            tables=memory.tables,
+            alembic=("0004_namespace",),
+            om_meta=_memory_meta(),
+            migrations=(),
+        ),
+    }
+
+    for module_id, layout in derived.items():
+        assert _decide(module_id, base, layout) == ps.ModuleSchema(
+            module_id,
+            "public",
+            f"public__{module_id}",
+            ledger=layout.ledger(module_id),
+        )
+    # Without its history there, the module is refused as before.
+    assert "neither is selected" in _refusal(
+        "session", base, _layout("public__session", objects=0)
+    )
 
 
 def test_tables_without_a_ledger_are_not_evidence() -> None:
@@ -225,16 +333,16 @@ def test_tables_without_a_ledger_are_not_evidence() -> None:
 
     message = ps.runtime_refusal(base)
     assert message is not None and "no runtime storage ledger" in message
-    with pytest.raises(SchemaOwnershipError, match="no session ledger"):
-        _decide("session", base)
+    assert "no session ledger" in _refusal("session", base)
 
 
 def test_unknown_tables_with_owner_names_are_refused() -> None:
     base = _layout(tables={"sessions": "id integer NOT NULL; pk(id)"})
 
+    fact = "sessions matches no recorded ledger (its columns match no listed history)"
     message = ps.runtime_refusal(base)
-    assert message is not None and "sessions (matches no listed history)" in message
-    assert _outcome("session", base) == "refused"
+    assert message is not None and fact in message
+    assert fact in _refusal("session", base)
     assert _outcome("memory", base) == "public__memory"
 
 
@@ -249,10 +357,8 @@ def test_a_shared_ledger_refuses_the_owners_it_does_not_prove() -> None:
         om_meta={"module_id": "registry", "schema_head": "0001_baseline"},
     )
 
-    with pytest.raises(SchemaOwnershipError, match="agents is missing"):
-        _decide("registry", base)
-    with pytest.raises(SchemaOwnershipError, match="no artifact ledger"):
-        _decide("artifact", base)
+    assert "agents is missing" in _refusal("registry", base)
+    assert "no artifact ledger" in _refusal("artifact", base)
     assert ps.runtime_refusal(base) is None
     assert _outcome("secret", base) == "public__secret"
 
@@ -267,13 +373,13 @@ def test_both_locations_are_refused() -> None:
     )
     derived = _layout("public__memory", objects=0)
 
-    with pytest.raises(SchemaOwnershipError, match="neither is selected"):
-        _decide("memory", base, derived)
+    assert "neither is selected" in _refusal("memory", base, derived)
 
 
 def test_existing_derived_schema_rules() -> None:
     base = _layout()
     memory = _history("memory", "alembic 0004_namespace")
+    registry = _history("registry", "store 0001_baseline")
 
     empty = _layout("public__memory", objects=0)
     assert _decide("memory", base, empty) == ps.ModuleSchema(
@@ -287,40 +393,51 @@ def test_existing_derived_schema_rules() -> None:
         migrations=(),
     )
     assert _decide("memory", base, own).schema == "public__memory"
-    # A store bootstrap that stopped before writing om_meta: every table is the
-    # module's, by name and exact columns.
+    # A store bootstrap that stopped before writing om_meta: every table is one this
+    # code's registry store creates, with the same columns.
     partial = _layout(
         "public__registry",
-        tables={
-            "agents": _history("registry", "alembic 0001_baseline").tables["agents"],
-            "core_events": None,
-        },
+        tables={"agents": registry.tables["agents"], "core_events": None},
     )
     assert _decide("registry", base, partial).schema == "public__registry"
 
     refusals = {
-        "foreign table": _layout("public__memory", tables={"notes": None}),
-        "objects but no table": _layout("public__memory", objects=2),
-        "other ledger": _layout(
+        "holds tables that are not memory's: notes": _layout(
+            "public__memory", tables={"notes": None}
+        ),
+        "holds objects but no table": _layout("public__memory", objects=2),
+        "records another owner's ledger: om_meta names 'a2a'": _layout(
             "public__memory",
             tables=memory.tables,
             alembic=("0004_namespace",),
             om_meta={"module_id": "a2a"},
         ),
-        "other columns": _layout(
+        "records another owner's ledger: migrations holds runtime storage": _layout(
             "public__memory",
-            tables={**memory.tables, "memory_records": "id text NOT NULL; pk(id)"},
-            alembic=("0004_namespace",),
-            om_meta=_memory_meta(),
+            tables={"migrations": _runtime(1)["migrations"]},
+            migrations=_runtime_rows(1),
         ),
-        "no privileges": ps.SchemaLayout(
-            name="public__memory", exists=True, owner="postgres", usage=True
+        "memory_records has other columns than memory alembic 0004_namespace lists": (
+            _layout(
+                "public__memory",
+                tables={**memory.tables, "memory_records": "id text NOT NULL; pk(id)"},
+                alembic=("0004_namespace",),
+                om_meta=_memory_meta(),
+            )
+        ),
+        # No ledger: only this code's store bootstrap leaves tables there, and the
+        # memory store creates its tables with its Alembic ledger.
+        "has no memory ledger, and these tables are not ones this code's memory store "
+        "creates, with the same columns: memory_records": _layout(
+            "public__memory",
+            tables={"memory_records": memory.tables["memory_records"]},
+        ),
+        'GRANT USAGE, CREATE ON SCHEMA "public__memory" TO "app"': ps.SchemaLayout(
+            name="public__memory", exists=True, owner="postgres", create=True
         ),
     }
-    for case, derived in refusals.items():
-        with pytest.raises(SchemaOwnershipError):
-            _decide("memory", base, derived)
-        assert case
+    for fragment, derived in refusals.items():
+        assert fragment in _refusal("memory", base, derived), fragment
 
 
 def test_privilege_and_name_refusals_name_the_fix() -> None:

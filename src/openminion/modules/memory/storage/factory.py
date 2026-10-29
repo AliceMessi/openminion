@@ -198,13 +198,17 @@ def resolve_memory_backend(
         postgres_kwargs: dict[str, Any] = {}
         if artifactctl is not None:
             postgres_kwargs["artifactctl"] = artifactctl
-        store = PostgresMemoryStore(
-            engine,
-            database_path=db_path,
-            owns_engine=True,
-            postgres_schema=selection,
-            **postgres_kwargs,
-        )
+        try:
+            store = PostgresMemoryStore(
+                engine,
+                database_path=db_path,
+                owns_engine=True,
+                postgres_schema=selection,
+                **postgres_kwargs,
+            )
+        except BaseException:
+            engine.dispose()
+            raise
         return _resolved_backend("postgres", store)
 
     sqlite_kwargs: dict[str, Any] = {}
