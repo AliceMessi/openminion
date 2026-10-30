@@ -1,11 +1,39 @@
 # OpenMinion Changelog
 
 Status: active
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 This file tracks package-facing release notes for `openminion`.
 
 ## Unreleased
+
+- Give each PostgreSQL module its own schema, and refuse a layout whose
+  ownership is not proven before any table is written. Runtime storage and
+  every module wrote into the one schema the configured URL selects, so they
+  shared `alembic_version` and `om_meta`, and `CREATE TABLE IF NOT EXISTS`
+  let one owner adopt another's `sessions`, `events`, `idempotency_keys`,
+  `memory_records`, `migrations` or `agents`. Runtime storage keeps that
+  schema; each module now uses `<base>__<module id>`, created inside its
+  migration transaction (or, for a store without Alembic, in its own
+  transaction before its first table), on a connection that keeps the URL's
+  options and adds `-c search_path`. A module whose history is already in the
+  base schema, such as a dedicated PostgreSQL memory database, stays there
+  with no move or stamp. A table counts as an owner's only when that owner's
+  ledger is recorded in the schema and the table exactly matches one listed
+  for that ledger in `postgres_histories.json`, which was measured from every
+  published release and this code. An existing `<base>__<module id>` is used
+  only when it is empty or holds the module's proven history; one with tables
+  but no ledger of the module, such as a first start stopped before
+  `om_meta`, is refused. A shared or unknown layout, for example
+  the A2A audit store on the runtime URL, or memory first and then runtime
+  storage, is refused with a message that names its tables, for the owners
+  that use them only. Upgrade: run `openminion storage migrate --backend
+  postgres` before the module stores start, and connect the module stores
+  directly or through a pooler that passes the `options` startup parameter.
+  `docs/runtime-database-upgrades.md` gives the details and the operator's
+  relocation steps (Refs #446).
+
+## Current package line - 2026-10-29
 
 - Ask the agent's `memory.write` authorization before a turn captures memory.
   A turn's auto fact extraction and its capture bundle write ran without a
@@ -82,31 +110,6 @@ This file tracks package-facing release notes for `openminion`.
   database the baseline created, where it failed with a duplicate
   `next_attempt_at` column, on SQLite too. The SQLite DDL and the revisions
   are unchanged (Refs #494).
-- Give each PostgreSQL module its own schema, and refuse a layout whose
-  ownership is not proven before any table is written. Runtime storage and
-  every module wrote into the one schema the configured URL selects, so they
-  shared `alembic_version` and `om_meta`, and `CREATE TABLE IF NOT EXISTS`
-  let one owner adopt another's `sessions`, `events`, `idempotency_keys`,
-  `memory_records`, `migrations` or `agents`. Runtime storage keeps that
-  schema; each module now uses `<base>__<module id>`, created inside its
-  migration transaction (or, for a store without Alembic, in its own
-  transaction before its first table), on a connection that keeps the URL's
-  options and adds `-c search_path`. A module whose history is already in the
-  base schema, such as a dedicated PostgreSQL memory database, stays there
-  with no move or stamp. A table counts as an owner's only when that owner's
-  ledger is recorded in the schema and the table exactly matches one listed
-  for that ledger in `postgres_histories.json`, which was measured from every
-  published release and this code. An existing `<base>__<module id>` is used
-  only when it is empty or holds the module's proven history; one with tables
-  but no ledger of the module, such as a first start stopped before
-  `om_meta`, is refused. A shared or unknown layout, for example
-  the A2A audit store on the runtime URL, or memory first and then runtime
-  storage, is refused with a message that names its tables, for the owners
-  that use them only. Upgrade: run `openminion storage migrate --backend
-  postgres` before the module stores start, and connect the module stores
-  directly or through a pooler that passes the `options` startup parameter.
-  `docs/runtime-database-upgrades.md` gives the details and the operator's
-  relocation steps (Refs #446).
 
 ## Current package line - 2026-10-28
 
