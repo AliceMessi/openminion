@@ -138,7 +138,10 @@ def test_listed_histories_match_this_code() -> None:
             if ledger.startswith("alembic ")
             and any("current" in h.measured for h in items)
         }
-        assert current == {f"alembic {s.revision}" for s in chain.walk_revisions()}
+        # Every revision of the chain, and the chain downgraded to base (no table).
+        assert current == {"alembic base"} | {
+            f"alembic {s.revision}" for s in chain.walk_revisions()
+        }
         assert ps.alembic_head(owner) == f"alembic {chain.get_current_head()}"
 
 

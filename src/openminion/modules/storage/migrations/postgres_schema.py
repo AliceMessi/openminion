@@ -10,7 +10,8 @@ they shared ``alembic_version`` and ``om_meta`` and adopted each other's tables 
 
 The evidence is an owner's ledger together with exact tables. The ledger is the ``migrations``
 rows v1..vk for runtime storage, and for a module ``om_meta.module_id`` with its
-``alembic_version`` row, or with ``om_meta.schema_head`` for a store that has no Alembic ledger.
+``alembic_version`` row (none at Alembic base), or with ``om_meta.schema_head`` for a store that
+has no Alembic ledger.
 A table belongs to an owner when that owner's ledger is recorded in the schema and a history
 listed for that ledger in ``postgres_histories.json`` has the table with the same columns, types,
 NOT NULL and primary key. An owner's history there is proven when every table of one listed
@@ -163,6 +164,9 @@ class SchemaLayout:
             return None
         if self.alembic is None:
             return f"store {meta.get('schema_head', '')}"
+        if not self.alembic:
+            # The module's Alembic chain downgraded to base: no revision, no table.
+            return "alembic base"
         if len(self.alembic) == 1:
             return f"alembic {self.alembic[0]}"
         return None

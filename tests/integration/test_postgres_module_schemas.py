@@ -240,7 +240,9 @@ def _legacy_runtime(url: str) -> str:
     return "ok"
 
 
-def _legacy_module(url: str, module_id: str, target: str = "head") -> None:
+def _legacy_module(
+    url: str, module_id: str, target: str = "head", *, downgrade: bool = False
+) -> None:
     """A module's Alembic chain in `public`, as earlier code ran every module there."""
     from alembic import command
     from alembic.config import Config
@@ -256,7 +258,7 @@ def _legacy_module(url: str, module_id: str, target: str = "head") -> None:
     try:
         with engine.begin() as conn:
             cfg.attributes["connection"] = conn
-            command.upgrade(cfg, target)
+            (command.downgrade if downgrade else command.upgrade)(cfg, target)
     finally:
         engine.dispose()
 
@@ -1324,8 +1326,8 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
             return
         if owner == postgres_schema.RUNTIME:
             ledger = f"v{len(layout.migrations or ())}"
-        elif layout.alembic:
-            ledger = f"alembic {layout.alembic[0]}"
+        elif layout.alembic is not None:
+            ledger = f"alembic {layout.alembic[0] if layout.alembic else 'base'}"
         else:
             ledger = f"store {(layout.om_meta or {}).get('schema_head')}"
         tables = _all_signatures(database, schema)
@@ -1368,6 +1370,9 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
                 check(module_id, schema)
         finally:
             engine.dispose()
+        # And the chain downgraded to base, as an operator can with Alembic.
+        _legacy_module(schema_url(database, schema), module_id, "base", downgrade=True)
+        check(module_id, schema)
 
     # Each module store alone, after its module's Alembic head, and followed by it.
     for index, (name, (module_id, build)) in enumerate(_STORES.items()):
