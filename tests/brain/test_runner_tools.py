@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -37,10 +38,12 @@ from openminion.modules.brain.loop.tools.contracts import (
 from openminion.modules.brain.adapters.tool.permission_mode import (
     canonical_permission_mode,
 )
+from openminion.modules.brain.adapters.tool.results import run_tool_spec
 from openminion.modules.brain.tools.executor import (
     RunnerCommandExecutor,
     execute_action,
 )
+from openminion.modules.brain.tools.executor.tool import _tool_outcome_from_result
 from openminion.modules.tool.registry import ToolRegistry, ToolSpec
 from openminion.modules.policy.adapters.brain import PolicyCtlBrainAdapter
 from openminion.modules.policy.models import RiskSpec
@@ -945,6 +948,87 @@ def test_tool_call_that_did_not_run_stages_no_tool_outcome() -> None:
         ] == []
         assert state.memory_candidates == []
         assert "staged_count" not in state.module_state.get("tool_outcome_memory", {})
+
+
+def test_executed_takeover_result_is_policy_denied_and_stages_no_tool_outcome() -> (
+    None
+):
+    # Intentional tradeoff of #524: a tool that ran and returned
+    # requires_user_takeover gets the status needs_user, so its outcome is
+    # policy_denied and stages no candidate. The same call without takeover
+    # stages its allowlisted success candidate.
+    calls: list[dict[str, object]] = []
+
+    def _run_tool(takeover: bool) -> dict[str, object]:
+        def _handler(args, _context):
+            calls.append(dict(args))
+            return {"ok": True, "requires_user_takeover": takeover}
+
+        with patch(
+            "openminion.modules.brain.adapters.tool.results.emit_tool_execution_event"
+        ):
+            return run_tool_spec(
+                spec=SimpleNamespace(name="web.fetch", handler=_handler),
+                validated_args={"url": "https://example.com"},
+                context=SimpleNamespace(tool_call_id="call-takeover", artifacts=[]),
+                start_time=time.monotonic(),
+                background_write_authorized=False,
+                tool_name="web.fetch",
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner, session = _build_runner(Path(tmp), policy_api=LocalPolicyAdapter())
+        state = runner._load_or_init_state("s-tool-outcome-takeover")
+        logger = CanonicalEventLogger(
+            session_api=session,
+            session_id=state.session_id,
+            agent_id=runner.profile.agent_id,
+        )
+        executor = RunnerCommandExecutor(runner)
+        results = {}
+        for takeover in (False, True):
+            command = ToolCommand(
+                command_id=f"cmd-takeover-{str(takeover).lower()}",
+                title="Tool call: web.fetch",
+                tool_name="web.fetch",
+                args={"url": "https://example.com"},
+                success_criteria={"status": "success"},
+            )
+            prepared = PreparedToolDispatch(
+                approved_command=command,
+                original_command=command,
+                command_id=command.command_id,
+                tool_name=command.tool_name,
+                validated_args=dict(command.args),
+                session_id=state.session_id,
+                trace_id=str(state.trace_id or ""),
+                agent_id=runner.profile.agent_id,
+                lineage={},
+                permission_mode="ask",
+                payload={},
+            )
+            results[takeover] = executor.finalize_tool_result(
+                state=state,
+                prepared_dispatch=prepared,
+                raw_result=RawToolResult(
+                    command_id=command.command_id,
+                    tool_name=command.tool_name,
+                    raw_output=_run_tool(takeover),
+                ),
+                logger=logger,
+            ).action_result
+
+        assert calls == [{"url": "https://example.com"}] * 2
+        assert results[False] is not None and results[False].status == "success"
+        assert results[True] is not None and results[True].status == "needs_user"
+        assert _tool_outcome_from_result(action_result=results[True]) == (
+            "policy_denied"
+        )
+        assert [
+            entry["title"]
+            for entry in _memory_entries(runner)
+            if entry.get("kind") == "candidate"
+        ] == ["tool_outcome:web.fetch:success"]
 
 
 def test_tool_outcome_is_not_staged_when_the_turn_may_not_write_memory() -> None:
