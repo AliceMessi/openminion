@@ -98,13 +98,19 @@ and neither is a table without its owner's ledger.
   names it and every base table with one of its names belongs to other
   owners only. It also keeps `<base>__<module id>` when that schema holds
   its proven history, the base schema records no ledger of it, and each
-  base table in question has a name that another owner uses too; a base
-  table with a name only the module uses could be its own rows, so the
-  module is then refused instead (two locations). An existing
-  `<base>__<module id>` is used only when it is empty, or holds the module's
-  proven history, or, with no ledger yet (a store that stopped before
-  writing `om_meta`), holds only tables that this code's store for the
-  module creates, each exact; the role needs `USAGE` and `CREATE` on it.
+  base table in question has a name that another owner uses too; its
+  connections use only `<base>__<module id>`, so it never reads or writes
+  those base tables. A base table with a name only the module uses could be
+  its own rows, so the module is then refused instead (two locations).
+- An existing `<base>__<module id>` is used only when it is empty, or when
+  it records the module's ledger and holds one of its listed histories,
+  proven. The storage engine's tables there (`core_events`,
+  `core_sidecar_rows`, `sidecar_ingest_log`, which a module store creates
+  next to its own) must then have the exact columns this code creates, as
+  listed in `postgres_histories.json`. A `<base>__<module id>` with tables
+  but no ledger of the module is refused, whatever the tables are (see
+  [A module schema without its ledger](#a-module-schema-without-its-ledger)).
+  The role needs `USAGE` and `CREATE` on it.
 - Everything else is refused before any write. The message gives the ledger
   recorded there and, for each table, the owner whose ledger records it, or
   that it matches no recorded ledger. Owners that use none of the refused
@@ -124,6 +130,8 @@ and neither is a table without its owner's ledger.
 | Runtime storage history with one of its tables missing | refused | create `<base>__<id>` |
 | A module's proven history in `<base>__<id>`, and base tables with names it shares with another owner, but no ledger of it | as above | that module keeps `<base>__<id>` |
 | A module's proven history in `<base>__<id>`, and base tables with names only it uses, without its ledger | as above | refused: two locations |
+| `<base>__<id>` with tables but no ledger of the module: some of its store's tables, a storage engine table, or a first start stopped before `om_meta` | as above | that module refused |
+| A module's proven history in `<base>__<id>` next to a storage engine table with other columns | as above | that module refused |
 | The module's ledger in the base schema, and `<base>__<id>` exists | as above | refused: two locations |
 | `search_path` names no existing schema | refused | refused |
 | A base schema name with other characters than letters, digits and `_`, or a `<base>__<id>` longer than 63 bytes | as above | a module that needs `<base>__<id>` refused |
@@ -140,7 +148,9 @@ The other entries were measured from every published package from 0.0.1 to
 listed (`upgraded_from`) only when an installed upgrade from that package to
 this code kept its rows and ended in one of this code's histories. Any other
 layout, including the few that early 0.0.x packages left and this code
-cannot upgrade, is refused as unknown.
+cannot upgrade, is refused as unknown. `engine_tables` lists the storage
+engine's tables with the exact columns this code creates next to a module
+store's tables in `<base>__<module id>`.
 
 A new runtime migration, Alembic revision or store table changes what this
 code builds. `tests/storage/test_postgres_schema.py` checks without a server
@@ -325,6 +335,20 @@ table; memory's baseline creates one too. An empty one proves neither, so
 runtime storage and memory refuse it, and OpenMinion never adopts or drops
 it. Before you remove it, find where it came from (the logs of the failed
 start, or a memory history next to it) and take a full `pg_dump`.
+
+### A module schema without its ledger
+
+A `<base>__<module id>` that holds tables but no ledger of the module is
+refused, whatever the tables are, also when they have exactly the columns
+this code's store creates: some of a store's tables, a copy, and what a
+store's first start leaves when it stops after its tables and before it
+writes `om_meta` look the same. A second process that opens the same module
+store while the first start is still creating its tables sees that layout
+too and is refused; a later start succeeds once the first one has written
+`om_meta`. OpenMinion never completes, adopts or drops such a schema.
+Before you remove it, find where it came from (the logs of the first start)
+and take a full `pg_dump`; a module store creates the schema again when it
+does not exist.
 
 ### Permissions
 

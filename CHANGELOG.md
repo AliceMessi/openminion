@@ -96,7 +96,10 @@ This file tracks package-facing release notes for `openminion`.
   with no move or stamp. A table counts as an owner's only when that owner's
   ledger is recorded in the schema and the table exactly matches one listed
   for that ledger in `postgres_histories.json`, which was measured from every
-  published release and this code. A shared or unknown layout, for example
+  published release and this code. An existing `<base>__<module id>` is used
+  only when it is empty or holds the module's proven history; one with tables
+  but no ledger of the module, such as a first start stopped before
+  `om_meta`, is refused. A shared or unknown layout, for example
   the A2A audit store on the runtime URL, or memory first and then runtime
   storage, is refused with a message that names its tables, for the owners
   that use them only. Upgrade: run `openminion storage migrate --backend
