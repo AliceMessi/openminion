@@ -713,6 +713,12 @@ def _skill_store(url: str, root: Path):
     )
 
 
+def _registry_store(url: str, root: Path):
+    return _factory(
+        "openminion.modules.registry.storage", "build_registry_store", "r.db"
+    )(url, root)
+
+
 def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
     """Run one owner the way an installation does; return its refusal message."""
     if owner == "runtime":
@@ -730,6 +736,10 @@ def _attempt(owner: str, url: str, tmp_path: Path, capsys) -> str:
     if owner == "skill-store":
         with pytest.raises(Exception) as refused:
             _skill_store(url, tmp_path / "skill-again")
+        return str(refused.value)
+    if owner == "registry-store":
+        with pytest.raises(Exception) as refused:
+            _registry_store(url, tmp_path / "registry-again")
         return str(refused.value)
     entry = _migrate(url, tmp_path, capsys, owner)
     assert entry["code"] == 1 and entry[owner]["status"] == "error", entry
@@ -832,6 +842,154 @@ def test_a_failed_module_migration_leaves_no_schema(
     assert report.success is False and "division by zero" in str(report.error)
     assert _snapshot(database) == before
     assert _schemas(database) == ["public"]
+
+
+# ---------------------------------------------------------------------------- module schemas
+
+
+def _one_store_table(url: str, tmp_path: Path) -> None:
+    """`public__registry` with only `agent_methods`, as the registry store creates it."""
+    _execute(
+        url,
+        'CREATE SCHEMA "public__registry"',
+        'CREATE TABLE "public__registry".agent_methods (agent_id TEXT NOT NULL, '
+        "method TEXT NOT NULL, quality_tier TEXT, cost_tier TEXT, "
+        "latency_hint_ms INTEGER, PRIMARY KEY (agent_id, method))",
+    )
+
+
+def _foreign_engine_table(url: str, tmp_path: Path) -> None:
+    _execute(
+        url,
+        'CREATE SCHEMA "public__registry"',
+        'CREATE TABLE "public__registry".core_events (foreign_payload text)',
+    )
+
+
+def _first_start_stopped_before_om_meta(url: str, tmp_path: Path) -> None:
+    """The registry store's first start, stopped after its tables, before om_meta."""
+    from openminion.modules.storage.runtime import module_store
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("stopped before om_meta")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module_store, "ensure_module_metadata_via_store", stop)
+        with pytest.raises(RuntimeError, match="stopped before om_meta"):
+            _registry_store(url, tmp_path / "first")
+
+
+REGISTRY_FIRST_START = {
+    "agent_methods",
+    "agent_status",
+    "agents",
+    "core_events",
+    "core_sidecar_rows",
+    "sidecar_ingest_log",
+}
+NO_LEDGER = {
+    # layout: (builder, the tables of `public__registry`, all exact)
+    "one-store-table": (_one_store_table, {"agent_methods"}, True),
+    "foreign-engine-table": (_foreign_engine_table, {"core_events"}, False),
+    "first-start-stopped-before-om-meta": (
+        _first_start_stopped_before_om_meta,
+        REGISTRY_FIRST_START,
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize("layout", sorted(NO_LEDGER))
+def test_a_module_schema_without_its_ledger_is_refused_without_writing(
+    layout: str, database: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tables in `<base>__<module id>` without the module's ledger prove nothing, also
+    when they have exactly the columns this code creates; the base schema is empty."""
+    build, tables, exact = NO_LEDGER[layout]
+    # What a complete first start of this code's registry store creates, elsewhere.
+    _execute(database, "CREATE SCHEMA ref")
+    _registry_store(schema_url(database, "ref"), tmp_path / "ref").close()
+    reference = _all_signatures(database, "ref__registry")
+    build(database, tmp_path)
+    found = _all_signatures(database, "public__registry")
+    assert set(found) == tables and not _tables(database, "public")
+    assert exact == all(reference.get(t) == sig for t, sig in found.items())
+    capsys.readouterr()
+    before = _snapshot(database)
+
+    messages = [
+        _attempt(owner, database, tmp_path, capsys)
+        for owner in ("registry-store", "registry")
+    ]
+
+    # No new schema, table, ledger row or row, and no changed column or index.
+    assert _snapshot(database) == before
+    for message in messages:
+        assert (
+            f'"public__registry" holds tables ({", ".join(sorted(tables))}) but '
+            "records no registry ledger"
+        ) in message
+        assert "Nothing was written" in message and "take a full pg_dump" in message
+
+
+def test_a_fresh_module_schema_is_initialized_and_reopened(
+    database: str, tmp_path: Path
+) -> None:
+    """Controls: an empty `<base>__<module id>` (here one a database administrator
+    created for registry; the others do not exist yet) is initialized, and each
+    store's first start leaves its ledger, so the next start is accepted."""
+    from openminion.modules.storage.migrations import postgres_schema
+
+    _execute(database, 'CREATE SCHEMA "public__registry"')
+    for name, (module_id, build) in _STORES.items():
+        for start in ("first", "next"):
+            close = getattr(
+                build(database, tmp_path / f"{name}-{start}"), "close", None
+            )
+            if callable(close):
+                close()
+        layout = _read(database, f"public__{module_id}")
+        history = postgres_schema.complete_history(module_id, layout)
+        assert history is not None and "current" in history.measured, name
+    assert _schemas(database) == sorted(
+        ["public", *{f"public__{m}" for m, _ in _STORES.values()}]
+    )
+    assert not _tables(database, "public")
+
+
+def test_a_proven_module_schema_never_touches_unproven_base_tables(
+    database: str, tmp_path: Path
+) -> None:
+    """Control: after runtime storage's `sessions` is altered, runtime storage is
+    refused, and the session store keeps its proven `public__session` without
+    reading or writing the base schema."""
+    from openminion.modules.session.runtime.factory import build_module_session_store
+
+    def sessions(root: Path):
+        return build_module_session_store(
+            config=_storage_config(database, root),
+            database_path=root / "sessions.db",
+            env={},
+        )
+
+    _start_runtime(database, tmp_path / "rt")
+    _runtime_rows(database)
+    sessions(tmp_path / "s1").close()
+    _execute(database, "ALTER TABLE public.sessions ADD COLUMN added_by_hand TEXT")
+    with pytest.raises(Exception, match="not provably its own"):
+        _start_runtime(database, tmp_path / "rt2")
+    before = _snapshot(database)["public"]
+
+    store = sessions(tmp_path / "s2")
+    try:
+        session_id = store.create_session(
+            initial_agent_id="a", profile_version="v1", title="t", tags=[]
+        )
+        assert store.get_session(session_id) is not None
+    finally:
+        store.close()
+
+    assert _snapshot(database)["public"] == before
 
 
 # ---------------------------------------------------------------------------- schemas, roles
@@ -1147,10 +1305,14 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
     built: set[tuple[str, str]] = set()
     unlisted: list[tuple[str, str, dict[str, str]]] = []
     catalog = postgres_schema._catalog()  # noqa: SLF001
-    skip = catalog.engine_tables | {"alembic_version", "om_meta"}
+    skip = set(catalog.engine_tables) | {"alembic_version", "om_meta"}
+    engine_built: dict[str, set[str]] = {}
 
     def check(owner: str, schema: str) -> None:
         layout = _read(database, schema)
+        for table in catalog.engine_tables:
+            if layout.tables.get(table) is not None:
+                engine_built.setdefault(table, set()).add(str(layout.tables[table]))
         history = postgres_schema.complete_history(owner, layout)
         owned = {t for t in layout.tables if t in catalog.names[owner]}
         if (
@@ -1244,6 +1406,11 @@ def test_this_code_builds_only_listed_histories(database: str, tmp_path: Path) -
     }
     assert not unlisted, _paste_ready(unlisted)
     assert (sorted(listed - built), sorted(built - listed)) == ([], [])
+    # The storage engine's tables next to each store's tables, exactly as listed.
+    assert {t: set(s) for t, s in catalog.engine_tables.items()} == engine_built, (
+        '"engine_tables": '
+        + json.dumps({t: sorted(s) for t, s in sorted(engine_built.items())}, indent=1)
+    )
 
 
 # ---------------------------------------------------------------------------- relocation

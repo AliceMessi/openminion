@@ -55,6 +55,15 @@ def _with_column(sig: str) -> str:
     return sig.replace("; pk(", ", added_by_hand text; pk(")
 
 
+def _engine(**changed: str) -> dict[str, str]:
+    """The storage engine's tables, as this code creates them next to a store's tables."""
+    listed = ps._catalog().engine_tables
+    return {t: changed.get(t, sorted(sigs)[0]) for t, sigs in listed.items()}
+
+
+FOREIGN_CORE_EVENTS = "foreign_payload text; pk()"
+
+
 def _decide(
     module_id: str, base: ps.SchemaLayout, derived: ps.SchemaLayout | None = None
 ):
@@ -92,7 +101,15 @@ def test_listed_histories_name_their_tables_and_sources() -> None:
             for history in items:
                 assert history.measured, (owner, ledger)
                 assert all(";" in sig for sig in history.tables.values())
-    assert "core_events" in catalog.engine_tables
+    assert set(catalog.engine_tables) == {
+        "core_events",
+        "core_sidecar_rows",
+        "sidecar_ingest_log",
+    }
+    assert all(
+        sigs and all(";" in sig for sig in sigs)
+        for sigs in catalog.engine_tables.values()
+    )
 
 
 def test_listed_histories_match_this_code() -> None:
@@ -394,7 +411,6 @@ def test_both_locations_are_refused() -> None:
 def test_existing_derived_schema_rules() -> None:
     base = _layout()
     memory = _history("memory", "alembic 0004_namespace")
-    registry = _history("registry", "store 0001_baseline")
 
     empty = _layout("public__memory", objects=0)
     assert _decide("memory", base, empty) == ps.ModuleSchema(
@@ -402,19 +418,12 @@ def test_existing_derived_schema_rules() -> None:
     )
     own = _layout(
         "public__memory",
-        tables={**memory.tables, "core_events": None},
+        tables=memory.tables,
         alembic=("0004_namespace",),
         om_meta=_memory_meta(),
         migrations=(),
     )
     assert _decide("memory", base, own).schema == "public__memory"
-    # A store bootstrap that stopped before writing om_meta: every table is one this
-    # code's registry store creates, with the same columns.
-    partial = _layout(
-        "public__registry",
-        tables={"agents": registry.tables["agents"], "core_events": None},
-    )
-    assert _decide("registry", base, partial).schema == "public__registry"
 
     refusals = {
         "holds tables that are not memory's: notes": _layout(
@@ -440,10 +449,7 @@ def test_existing_derived_schema_rules() -> None:
                 om_meta=_memory_meta(),
             )
         ),
-        # No ledger: only this code's store bootstrap leaves tables there, and the
-        # memory store creates its tables with its Alembic ledger.
-        "has no memory ledger, and these tables are not ones this code's memory store "
-        "creates, with the same columns: memory_records": _layout(
+        "holds tables (memory_records) but records no memory ledger": _layout(
             "public__memory",
             tables={"memory_records": memory.tables["memory_records"]},
         ),
@@ -453,6 +459,65 @@ def test_existing_derived_schema_rules() -> None:
     }
     for fragment, derived in refusals.items():
         assert fragment in _refusal("memory", base, derived), fragment
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "one table of the store",
+        "a foreign storage engine table",
+        "an exact storage engine table",
+        "a first start stopped before om_meta",
+    ],
+)
+def test_a_module_schema_without_its_ledger_is_refused(case: str) -> None:
+    # The first two are the layouts of the review of f04b4eae; the last is every table a
+    # registry store's first start creates, exact, without its om_meta row. Tables
+    # without the module's ledger are not evidence, whatever their columns.
+    registry = _history("registry", "store 0001_baseline")
+    tables = {
+        "one table of the store": lambda: {
+            "agent_methods": registry.tables["agent_methods"]
+        },
+        "a foreign storage engine table": lambda: {"core_events": FOREIGN_CORE_EVENTS},
+        "an exact storage engine table": lambda: {
+            "core_events": _engine()["core_events"]
+        },
+        "a first start stopped before om_meta": lambda: {
+            **registry.tables,
+            **_engine(),
+        },
+    }[case]()
+    derived = _layout("public__registry", tables=tables)
+
+    message = _refusal("registry", _layout(), derived)
+    assert (
+        f'"public__registry" holds tables ({", ".join(sorted(tables))}) but records '
+        "no registry ledger" in message
+    )
+    assert "take a full pg_dump" in message
+
+
+def test_a_proven_module_schema_with_exact_engine_tables_is_used() -> None:
+    registry = _history("registry", "store 0001_baseline")
+    meta = {"module_id": "registry", "schema_head": "0001_baseline"}
+    own = _layout(
+        "public__registry", tables={**registry.tables, **_engine()}, om_meta=meta
+    )
+
+    assert _decide("registry", _layout(), own) == ps.ModuleSchema(
+        "registry", "public", "public__registry", ledger="store 0001_baseline"
+    )
+    # The storage engine's tables are held to their exact columns too.
+    foreign = _layout(
+        "public__registry",
+        tables={**registry.tables, **_engine(core_events=FOREIGN_CORE_EVENTS)},
+        om_meta=meta,
+    )
+    assert (
+        '"public__registry" holds core_events with other columns than this code\'s '
+        "storage engine creates"
+    ) in _refusal("registry", _layout(), foreign)
 
 
 def test_privilege_and_name_refusals_name_the_fix() -> None:
