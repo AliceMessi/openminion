@@ -16,7 +16,9 @@ listed for that ledger in ``postgres_histories.json`` has the table with the sam
 NOT NULL and primary key. An owner's history there is proven when every table of one listed
 history is present, belongs to that owner alone, and the owner has no other table there. A table
 an owner would create or read that is not proven its own is refused before any write; owners
-that use none of the refused table names are not affected.
+that use none of the refused table names are not affected. An existing ``<base>__<module id>``
+is used only when it is empty or holds the module's proven history; the storage engine's tables
+there must then have the exact columns this code creates.
 
 The checks read only catalogs and ledger rows, with explicit schema names, in one READ ONLY
 transaction.
@@ -67,12 +69,11 @@ class History:
 
 @dataclass(frozen=True)
 class _Catalog:
-    engine_tables: frozenset[str]
+    engine_tables: dict[str, frozenset[str]]  # storage engine table -> its signatures
     runtime_versions: dict[int, str]
     histories: dict[str, dict[str, tuple[History, ...]]]  # owner -> ledger -> histories
     names: dict[str, frozenset[str]]  # owner -> every table name in its histories
     signatures: dict[str, frozenset[str]]  # "owner/table" -> every listed signature
-    bootstrap: dict[str, frozenset[str]]  # "owner/table" -> this code's store tables
 
 
 @lru_cache(maxsize=1)
@@ -95,25 +96,22 @@ def _catalog() -> _Catalog:
     }
     names: dict[str, frozenset[str]] = {}
     sigs: dict[str, set[str]] = {}
-    bootstrap: dict[str, set[str]] = {}
     for owner, ledgers in histories.items():
         names[owner] = frozenset(
             table for items in ledgers.values() for h in items for table in h.tables
         )
         for items in ledgers.values():
             for h in items:
-                store = h.ledger.startswith("store ") and "current" in h.measured
                 for table, signature in h.tables.items():
                     sigs.setdefault(f"{owner}/{table}", set()).add(signature)
-                    if store:
-                        bootstrap.setdefault(f"{owner}/{table}", set()).add(signature)
     return _Catalog(
-        engine_tables=frozenset(data["engine_tables"]),
+        engine_tables={
+            table: frozenset(listed) for table, listed in data["engine_tables"].items()
+        },
         runtime_versions={int(k): v for k, v in data["runtime_versions"].items()},
         histories=histories,
         names=names,
         signatures={key: frozenset(value) for key, value in sigs.items()},
-        bootstrap={key: frozenset(value) for key, value in bootstrap.items()},
     )
 
 
@@ -222,7 +220,12 @@ def read_schema(connection: Connection, schema: str) -> SchemaLayout:
         return SchemaLayout(
             name=schema, exists=True, owner=str(owner), create=bool(create)
         )
-    known = {n for names in _catalog().names.values() for n in names} | _LEDGER_TABLES
+    catalog = _catalog()
+    known = (
+        {n for names in catalog.names.values() for n in names}
+        | set(catalog.engine_tables)
+        | _LEDGER_TABLES
+    )
     names = [
         r[0]
         for r in connection.execute(
@@ -630,12 +633,14 @@ def _proven_derived(module_id: str, layout: SchemaLayout, *, role: str) -> bool:
 
 
 def _derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str | None:
-    """None when an existing schema holds nothing but ``module_id``'s own objects.
+    """None when an existing ``<base>__<module id>`` can be used, else the refusal message.
 
-    That is: nothing at all (a schema a database administrator created); the module's proven
-    history; or, with no ledger yet, only tables that this code's store bootstrap for the module
-    creates, each exact (a bootstrap that stopped before it wrote ``om_meta``). The storage
-    engine's own tables are allowed in every case.
+    It can be used when it is empty (a schema a database administrator created, or one this code
+    created before its first table), or when it records the module's ledger, holds one of the
+    module's listed histories proven, and every storage engine table there has the exact columns
+    this code creates. A schema with tables but no ledger of the module is refused whatever the
+    tables are: a part of a store's tables, a copy, and a first start that stopped before it
+    wrote ``om_meta`` look the same.
     """
     if not (layout.usage and layout.create):
         return (
@@ -650,16 +655,17 @@ def _derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str 
         if layout.objects:
             return f"{where} holds objects but no table; it is not selected. {_NOTHING_WRITTEN}"
         return None
-    tables = {
-        t: sig
-        for t, sig in layout.tables.items()
-        if t not in catalog.engine_tables and t not in _LEDGER_TABLES
-    }
-    foreign = sorted(t for t in tables if t not in catalog.names.get(module_id, ()))
+    foreign = sorted(
+        t
+        for t in layout.tables
+        if t not in catalog.names.get(module_id, ())
+        and t not in catalog.engine_tables
+        and t not in _LEDGER_TABLES
+    )
     if foreign:
         return (
             f"{where} holds tables that are not {module_id}'s: {', '.join(foreign)}. "
-            f"{_NOTHING_WRITTEN}"
+            f"{_NOTHING_WRITTEN} {_GUIDANCE}"
         )
     meta = (layout.om_meta or {}).get("module_id")
     if meta not in (None, module_id) or layout.migrations:
@@ -668,29 +674,33 @@ def _derived_refusal(module_id: str, layout: SchemaLayout, *, role: str) -> str 
             if meta not in (None, module_id)
             else ("migrations holds runtime storage ledger rows")
         )
-        return f"{where} records another owner's ledger: {recorded}. {_NOTHING_WRITTEN}"
-    if not tables and not layout.alembic:
-        # Only the module's own ledger tables, or the storage engine's: a store that
-        # stopped before its first table, or a module downgraded to base.
-        return None
-    if layout.alembic or meta == module_id:
-        attribution = _attribution(layout)
-        if _proven(module_id, layout, attribution) is not None:
-            return None
+        return (
+            f"{where} records another owner's ledger: {recorded}. "
+            f"{_NOTHING_WRITTEN} {_GUIDANCE}"
+        )
+    if layout.ledger(module_id) is None:
+        return (
+            f"{where} holds tables ({', '.join(sorted(layout.tables))}) but records no "
+            f"{module_id} ledger: tables without their owner's ledger are not evidence, "
+            f"also when they have the columns this code's {module_id} store creates (a first "
+            f"start that stopped before it wrote om_meta leaves such a schema). "
+            f"{_NOTHING_WRITTEN} {_GUIDANCE}"
+        )
+    attribution = _attribution(layout)
+    if _proven(module_id, layout, attribution) is None:
         return (
             f"{where} is not provably {module_id}'s: "
-            f"{_facts(module_id, layout, attribution)}. {_NOTHING_WRITTEN}"
+            f"{_facts(module_id, layout, attribution)}. {_NOTHING_WRITTEN} {_GUIDANCE}"
         )
-    other = sorted(
+    engine = sorted(
         t
-        for t, sig in tables.items()
-        if sig not in catalog.bootstrap.get(f"{module_id}/{t}", frozenset())
+        for t, sig in layout.tables.items()
+        if t in catalog.engine_tables and sig not in catalog.engine_tables[t]
     )
-    if other:
+    if engine:
         return (
-            f"{where} has no {module_id} ledger, and these tables are not ones this code's "
-            f"{module_id} store creates, with the same columns: {', '.join(other)}. "
-            f"{_NOTHING_WRITTEN}"
+            f"{where} holds {', '.join(engine)} with other columns than this code's "
+            f"storage engine creates. {_NOTHING_WRITTEN} {_GUIDANCE}"
         )
     return None
 
@@ -736,8 +746,8 @@ def _select_on(connection: Connection, module_id: str) -> ModuleSchema:
 def check_module_connection(engine: Engine, module_id: str) -> ModuleSchema:
     """For an engine handed to a module directly: its current schema must be the module's own.
 
-    The schema is used in place when it holds the module's proven history, or as the module's
-    own schema when it holds nothing but the module's objects. Read only.
+    The schema is used when it holds the module's proven history, or when it is empty. Read
+    only.
     """
     with _read_only(engine) as connection:
         name = _current_schema(connection)

@@ -3,13 +3,14 @@
   "Supported PostgreSQL histories per owner (#446): measured, never inferred.",
   "Each history is one owner's ledger and its exact tables (columns, format_type, NOT NULL, primary key).",
   "measured: the published packages (installed from PyPI) and 'current' (this code) that created it.",
+  "engine_tables: the storage engine's tables, which a module store creates in its own schema next to the module's tables, with the exact signatures this code ('current') creates.",
   "See docs/runtime-database-upgrades.md, 'PostgreSQL schemas per owner'."
  ],
- "engine_tables": [
-  "core_events",
-  "core_sidecar_rows",
-  "sidecar_ingest_log"
- ],
+ "engine_tables": {
+  "core_events": ["agent_id text, blob_refs_json text NOT NULL, event_id text NOT NULL, event_type text NOT NULL, namespace text NOT NULL, payload_json text NOT NULL, session_id text, trace_id text, ts text NOT NULL; pk(event_id)"],
+  "core_sidecar_rows": ["namespace text NOT NULL, row_hash text NOT NULL, row_json text NOT NULL, table_name text NOT NULL, ts text NOT NULL; pk(row_hash)"],
+  "sidecar_ingest_log": ["event_id text, ingested_at text NOT NULL, line_no integer NOT NULL, namespace text NOT NULL, row_hash text NOT NULL, source_path text NOT NULL, table_name text; pk(line_no, source_path)"]
+ },
  "runtime_versions": {
   "1": "bootstrap_core_tables",
   "2": "add_session_contexts_table",
